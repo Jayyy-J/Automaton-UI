@@ -1,0 +1,14 @@
+{
+  "name": "automaton-demo",
+  "version": "1.0.0",
+  "description": "Simulated live dashboard for Automaton robot - wallet, tasks and survival status",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0",
+    "cors": "^2.8.5"
+  }
+}
