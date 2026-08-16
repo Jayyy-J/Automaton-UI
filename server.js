@@ -22,13 +22,13 @@ const DB_PATH = process.env.DB_PATH || path.join(__dirname, "automaton.db");
 // ---- config (tweak freely) -------------------------------------------------
 const STARTING_BALANCE = 340.0; // USD, seeded only on first run
 const MONTHLY_MAINTENANCE = 150.0; // USD "cost to stay alive" per month
-// Credits (tareas completadas) — esporádicas
-const MIN_CREDIT_MS = 15 * 60 * 1000; // 15 min
-const MAX_CREDIT_MS = 10 * 60 * 60 * 1000; // 10 h
+// Credits (tareas completadas)
+const MIN_CREDIT_MS = 5 * 60 * 1000; // 5 min
+const MAX_CREDIT_MS = 60 * 60 * 1000; // 1 h
 
-// Debits (cómputo, DB, ancho de banda) — más constantes, como costos de infra reales
-const MIN_DEBIT_MS = 5 * 60 * 1000; // 5 min
-const MAX_DEBIT_MS = 60 * 60 * 1000; // 1 h
+// Debits (cómputo, DB, ancho de banda)
+const MIN_DEBIT_MS = 60 * 60 * 1000; // 1 h
+const MAX_DEBIT_MS = 3 * 60 * 60 * 1000; // 3 h
 
 const TASK_NAMES = [
   "Web scraping — catálogo de precios",
@@ -167,7 +167,59 @@ scheduleDebit();
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+
+// Busca el frontend de forma case-insensitive (Linux/Railway distingue
+// mayúsculas de minúsculas — "Index.html" NO es lo mismo que "index.html").
+// Revisa primero public/, luego la raíz del repo.
+function findIndexHtml(dir) {
+  if (!fs.existsSync(dir)) return null;
+  const match = fs
+    .readdirSync(dir)
+    .find((f) => f.toLowerCase() === "index.html");
+  return match ? path.join(dir, match) : null;
+}
+
+const publicDir = path.join(__dirname, "public");
+let staticDir, indexPath;
+
+const foundInPublic = findIndexHtml(publicDir);
+const foundInRoot = findIndexHtml(__dirname);
+
+if (foundInPublic) {
+  staticDir = publicDir;
+  indexPath = foundInPublic;
+  console.log(`Frontend encontrado en ${indexPath}`);
+} else if (foundInRoot) {
+  staticDir = __dirname;
+  indexPath = foundInRoot;
+  console.log(
+    `Frontend encontrado en ${indexPath} (raíz del repo, no en public/)`
+  );
+} else {
+  staticDir = publicDir;
+  indexPath = path.join(publicDir, "index.html");
+  console.error(
+    `⚠️  No se encontró ningún archivo index.html (en cualquier combinación de mayúsculas/minúsculas) ni en public/ ni en la raíz del repo (${__dirname}).`
+  );
+}
+
+app.use(express.static(staticDir));
+
+// Fallback explícito: si por alguna razón express.static no resuelve "/",
+// servimos index.html directamente en vez de dejar que Express devuelva
+// "Cannot GET /".
+app.get("/", (req, res) => {
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res
+      .status(500)
+      .send(
+        "Falta index.html en el deploy. Revisa que el archivo esté commiteado en el repo (en public/ o en la raíz)."
+      );
+
+  }
+});
 
 app.get("/api/status", (req, res) => {
   const wallet = getWallet.get();
@@ -210,3 +262,4 @@ app.listen(PORT, () => {
   console.log(`Automaton simulation running on http://localhost:${PORT}`);
   console.log(`DB persisted at ${DB_PATH}`);
 });
+
