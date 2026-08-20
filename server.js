@@ -1,3 +1,4 @@
+
 // ============================================================================
 // AUTOMATON — simulated live ledger backend
 // ----------------------------------------------------------------------------
@@ -29,6 +30,11 @@ const MAX_CREDIT_MS = 60 * 60 * 1000; // 1 h
 // Debits (cómputo, DB, ancho de banda)
 const MIN_DEBIT_MS = 60 * 60 * 1000; // 1 h
 const MAX_DEBIT_MS = 3 * 60 * 60 * 1000; // 3 h
+
+// Pausa global de la simulación: en false, no se generan más eventos y el
+// saldo/historial quedan congelados tal como están. Se puede reactivar
+// después poniendo la variable de entorno SIMULATION_ENABLED=true en Railway.
+const SIMULATION_ENABLED = process.env.SIMULATION_ENABLED === "true";
 
 const TASK_NAMES = [
   "Web scraping — catálogo de precios",
@@ -160,8 +166,14 @@ function scheduleDebit() {
   setTimeout(debitTick, randBetween(MIN_DEBIT_MS, MAX_DEBIT_MS));
 }
 
-scheduleCredit();
-scheduleDebit();
+if (SIMULATION_ENABLED) {
+  scheduleCredit();
+  scheduleDebit();
+} else {
+  console.log(
+    "Simulación pausada (SIMULATION_ENABLED=false) — el saldo y el historial quedan congelados."
+  );
+}
 
 // ---- http api -----------------------------------------------------------
 const app = express();
@@ -262,4 +274,3 @@ app.listen(PORT, () => {
   console.log(`Automaton simulation running on http://localhost:${PORT}`);
   console.log(`DB persisted at ${DB_PATH}`);
 });
-
