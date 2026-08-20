@@ -21,7 +21,7 @@ const PORT = process.env.PORT || 4000;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "automaton.db");
 
 // ---- config (tweak freely) -------------------------------------------------
-const STARTING_BALANCE = 340.0; // USD, seeded only on first run
+const STARTING_BALANCE = 1930.39; // USD, seeded only on first run
 const MONTHLY_MAINTENANCE = 150.0; // USD "cost to stay alive" per month
 // Credits (tareas completadas)
 const MIN_CREDIT_MS = 5 * 60 * 1000; // 5 min
