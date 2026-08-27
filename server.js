@@ -231,7 +231,12 @@ function partitionBounded(sum, n, lo, hi) {
 }
 
 // ---- weekly plan generation --------------------------------------------------
-function generateWeeklyPlanIfMissing(weekStartDate) {
+// `planFromDate` is where slot generation actually starts (normally very
+// close to weekStartDate in steady state). When a plan is created mid-week —
+// a fresh deploy or a RESET_BALANCE_TO — it's forced to "now" so the very
+// first event is always at least EVENT_MIN_GAP_MS in the future, never a
+// backlog of already-past timestamps that would burst-deliver on startup.
+function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
   const weekStartKey = weekStartDate.toISOString();
   const existing = db
     .prepare("SELECT COUNT(*) AS c FROM planned_events WHERE week_start = ?")
@@ -239,21 +244,23 @@ function generateWeeklyPlanIfMissing(weekStartDate) {
   if (existing.c > 0) return;
 
   const weekEndDate = weekEndFromStart(weekStartDate);
+  const planStart =
+    planFromDate && planFromDate.getTime() > weekStartDate.getTime()
+      ? planFromDate
+      : weekStartDate;
   const target = round2(randBetween(WEEKLY_PROFIT_MIN, WEEKLY_PROFIT_MAX));
 
-  // 1) lay out event timestamps across the week, 15min-3h apart
+  // 1) lay out event timestamps from planStart through the end of the week,
+  // 15min-3h apart — never before planStart, so nothing is already "due".
   const slots = [];
-  let t = weekStartDate.getTime() + randBetween(EVENT_MIN_GAP_MS, EVENT_MAX_GAP_MS);
+  let t = planStart.getTime() + randBetween(EVENT_MIN_GAP_MS, EVENT_MAX_GAP_MS);
   while (t <= weekEndDate.getTime()) {
     slots.push(t);
     t += randBetween(EVENT_MIN_GAP_MS, EVENT_MAX_GAP_MS);
   }
   if (slots.length === 0) {
     slots.push(
-      Math.min(
-        weekStartDate.getTime() + EVENT_MIN_GAP_MS,
-        weekEndDate.getTime()
-      )
+      Math.min(planStart.getTime() + EVENT_MIN_GAP_MS, weekEndDate.getTime())
     );
   }
 
@@ -320,7 +327,7 @@ function generateWeeklyPlanIfMissing(weekStartDate) {
 
   const actualCreditSum = round2(creditAmounts.reduce((s, a) => s + a, 0));
   console.log(
-    `📅 Plan semanal generado: ${weekStartKey} → objetivo neto $${target} ` +
+    `📅 Plan semanal generado: semana ${weekStartKey} (eventos desde ${planStart.toISOString()}) → objetivo neto $${target} ` +
       `(créditos $${actualCreditSum} - débitos $${sumDebits} = $${round2(
         actualCreditSum - sumDebits
       )}), ${rows.length} eventos`
@@ -328,7 +335,8 @@ function generateWeeklyPlanIfMissing(weekStartDate) {
 }
 
 function ensureCurrentWeekPlanned() {
-  generateWeeklyPlanIfMissing(currentWeekStart(new Date()));
+  const now = new Date();
+  generateWeeklyPlanIfMissing(currentWeekStart(now), now);
 }
 
 // ---- delivering due events ---------------------------------------------------
