@@ -1,81 +1,51 @@
 # Automaton — panel de simulación
 
 Panel web que simula la actividad de un agente autónomo: tareas completadas,
-créditos/débitos a su wallet, y un cálculo de "autonomía restante" según su
-costo de mantenimiento mensual. Los eventos se generan solos cada 4–14
-segundos (aleatorio) y se guardan en SQLite (`automaton.db`), así que el
-historial persiste aunque reinicies el servidor o la máquina.
+créditos/débitos a su wallet, y una regla de negocio semanal (ver abajo). Los
+eventos se generan y persisten en SQLite (`automaton.db`), así que el
+historial sobrevive a reinicios y redeploys (mientras `automaton.db` viva en
+un Volume persistente).
 
 ⚠️ **Es un entorno de demo.** Los montos y tareas son generados
-automáticamente, no representan cobros o ingresos reales. El badge en la UI
-ya lo indica, pero acláraselo también de palabra al cliente.
+automáticamente, no representan cobros o ingresos reales.
 
-## Correr en tu VM de Ubuntu (WSL o nativo)
+## Regla semanal
 
-```bash
-cd automaton-demo
-npm install
-npm start
-```
+Cada semana (sábado 00:00 → viernes 23:59:59, hora Colombia) se planifica por
+adelantado:
 
-Abre `http://localhost:4000`. El servidor sigue generando eventos mientras
-esté corriendo. La próxima vez que lo arranques (`npm start`), lee el mismo
-`automaton.db` y continúa desde el saldo y el historial donde quedaron — no
-reinicia desde cero.
+1. Se sortea un objetivo de ganancia neta entre **$35 y $195**.
+2. Se generan los tiempos de los eventos de esa semana, separados entre
+   **15 minutos y 3 horas** entre sí.
+3. Los débitos (costos de infraestructura) son montos naturales al azar
+   ($0.10–$5).
+4. Los créditos (tareas pagadas) se calculan matemáticamente para que:
+   `total créditos − total débitos = objetivo semanal`, cada uno dentro de
+   $0.50–$25.
 
-Para dejarlo corriendo en segundo plano en la VM:
+Esto garantiza que, sin importar cuántos eventos ocurran, la semana siempre
+cierra el viernes con una ganancia neta dentro del rango pedido — no es pura
+casualidad, está calculado desde el inicio de la semana.
 
-```bash
-nohup npm start > automaton.log 2>&1 &
-```
+Un proceso interno revisa cada minuto si hay eventos "vencidos" (su hora ya
+llegó) y los aplica al saldo. Si el servidor estuvo apagado un rato, al volver
+a encender aplica de una vez los que se acumularon (no se pierden, solo se
+entregan en bloque).
 
-O, mejor, usa `pm2` para que sobreviva a reinicios de la VM:
+## Reiniciar el saldo a un valor específico
 
-```bash
-npm install -g pm2
-pm2 start server.js --name automaton
-pm2 save
-pm2 startup   # sigue las instrucciones que imprime
-```
+Si necesitas forzar el saldo a un número exacto (por ejemplo, para empezar
+una demo desde $1922.30):
 
-## Publicar con un dominio (Railway)
+1. En Railway → Variables, agrega `RESET_BALANCE_TO=1922.30`.
+2. Redeploy. Esto borra el historial y los planes anteriores, y deja el saldo
+   exactamente en ese valor.
+3. **Importante:** borra esa variable de entorno después de un deploy exitoso.
+   Si la dejas puesta, cada vez que el contenedor se reinicie volverá a
+   resetear el saldo.
 
-1. Sube esta carpeta a un repo de GitHub.
-2. En Railway: **New Project → Deploy from GitHub repo**.
-3. Railway detecta Node.js automáticamente y corre `npm install && npm start`.
-4. **Importante para la persistencia:** el sistema de archivos de Railway es
-   efímero en cada deploy nuevo. Para que `automaton.db` sobreviva entre
-   deploys, agrega un **Volume** en el servicio (Settings → Volumes) montado
-   en, por ejemplo, `/data`, y define la variable de entorno:
-   ```
-   DB_PATH=/data/automaton.db
-   ```
-5. Genera el dominio público desde Settings → Networking → Generate Domain
-   (o conecta tu propio dominio ahí mismo).
+## Pausar / reanudar la simulación
 
-Con el volumen montado, el historial sigue creciendo de forma continua sin
-importar cuántas veces redeploys el servicio.
+Por defecto la simulación está **activa**. Para congelarla (que el saldo y el
+historial queden fijos tal como están):
 
-## Configuración
-
-Todo lo ajustable está al inicio de `server.js`:
-
-- `STARTING_BALANCE` — saldo inicial (solo aplica la primera vez, antes de
-  que exista `automaton.db`).
-- `MONTHLY_MAINTENANCE` — costo mensual usado para calcular "días de
-  autonomía restante".
-- `MIN_EVENT_MS` / `MAX_EVENT_MS` — qué tan seguido se generan eventos.
-- `CREDIT_PROBABILITY` — proporción de eventos que son ingresos vs. gastos.
-- Débitos: aleatorios entre $0.10 y $5.00 (máximo pedido).
-- Créditos: aleatorios entre $0.50 y $25.00 (rango pedido).
-
-## Endpoints
-
-- `GET /api/status` — saldo actual, autonomía restante, totales del día.
-- `GET /api/events?limit=50` — últimos eventos del ledger.
-
-## Reiniciar desde cero
-
-Si en algún momento quieres que el cliente vea un arranque limpio, simplemente
-borra `automaton.db`, `automaton.db-shm` y `automaton.db-wal` y vuelve a
-iniciar el servidor.
