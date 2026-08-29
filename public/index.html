@@ -435,7 +435,7 @@ async function doWithdraw(){
       msg.textContent = data.error || 'No se pudo procesar el retiro.';
       msg.classList.add('err');
     } else {
-      msg.textContent = `Retiro de ${fmt(data.amount)} enviado a ${shortAddr(data.address)}.`;
+      msg.textContent = `Retiro de ${fmt(data.amount)} enviado a ${shortAddr(data.address)}. El saldo se acreditará en tu cuenta en un máximo de 72 horas, dependiendo de tu servicio o billetera.`;
       msg.classList.add('ok');
       addressInput.value = '';
       amountInput.value = '';
@@ -459,3 +459,4 @@ window.addEventListener('resize', drawECG);
 </script>
 </body>
 </html>
+
