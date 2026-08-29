@@ -114,6 +114,13 @@ db.exec(`
     fired INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_planned_due ON planned_events (fired, scheduled_ts);
+  CREATE TABLE IF NOT EXISTS withdrawals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    address TEXT NOT NULL,
+    amount REAL NOT NULL,
+    balance_after REAL NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -182,6 +189,46 @@ function pick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+// ---- Solana address validation ----------------------------------------------
+// Solana public keys are base58-encoded 32-byte values. A regex alone only
+// checks the character set (excludes 0/O/I/l, 32-44 chars) — decoding to
+// confirm the payload is exactly 32 bytes catches malformed strings that
+// happen to match the pattern but aren't a real key length.
+const BASE58_ALPHABET =
+  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_MAP = {};
+for (let i = 0; i < BASE58_ALPHABET.length; i++) BASE58_MAP[BASE58_ALPHABET[i]] = i;
+
+function base58Decode(str) {
+  let bytes = [0];
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    if (!(c in BASE58_MAP)) return null;
+    let carry = BASE58_MAP[c];
+    for (let j = 0; j < bytes.length; j++) {
+      carry += bytes[j] * 58;
+      bytes[j] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  for (let k = 0; k < str.length - 1 && str[k] === "1"; k++) {
+    bytes.push(0);
+  }
+  return bytes.reverse();
+}
+
+function isValidSolanaAddress(address) {
+  if (typeof address !== "string") return false;
+  const trimmed = address.trim();
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmed)) return false;
+  const decoded = base58Decode(trimmed);
+  return !!decoded && decoded.length === 32;
+}
+
 // ---- Colombia-week helpers --------------------------------------------------
 function colombiaShifted(date) {
   return new Date(date.getTime() + TZ_OFFSET_HOURS * 3600 * 1000);
@@ -248,7 +295,18 @@ function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
     planFromDate && planFromDate.getTime() > weekStartDate.getTime()
       ? planFromDate
       : weekStartDate;
-  const target = round2(randBetween(WEEKLY_PROFIT_MIN, WEEKLY_PROFIT_MAX));
+
+  // If the plan starts mid-week (deploy/reset happened partway through),
+  // scale the target proportionally to the time actually remaining —
+  // asking a 3-hour tail-end of the week to hit a full week's $35-195
+  // target with only 1-3 events isn't just unrealistic-looking, it can be
+  // mathematically infeasible within the per-event $0.50-$25 credit cap.
+  const fullWeekMs = weekEndDate.getTime() - weekStartDate.getTime();
+  const remainingMs = Math.max(0, weekEndDate.getTime() - planStart.getTime());
+  const timeFraction = Math.min(1, remainingMs / fullWeekMs);
+  const scaledMin = Math.max(1, round2(WEEKLY_PROFIT_MIN * timeFraction));
+  const scaledMax = Math.max(scaledMin, round2(WEEKLY_PROFIT_MAX * timeFraction));
+  const target = round2(randBetween(scaledMin, scaledMax));
 
   // 1) lay out event timestamps from planStart through the end of the week,
   // 15min-3h apart — never before planStart, so nothing is already "due".
@@ -270,7 +328,7 @@ function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
   );
 
   // safety floor: at least 30% of slots must be credit so the bounded
-  // partition below always has enough room to hit the target
+  // partition below usually has enough room to hit the target
   const minCredits = Math.max(1, Math.ceil(types.length * 0.3));
   let creditCount = types.filter((t) => t === "credit").length;
   for (let i = 0; i < types.length && creditCount < minCredits; i++) {
@@ -284,14 +342,31 @@ function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
   const debitAmounts = types.map((ty) =>
     ty === "debit" ? round2(randBetween(DEBIT_MIN, DEBIT_MAX)) : null
   );
-  const sumDebits = round2(
+  let sumDebits = round2(
     debitAmounts.reduce((s, a) => s + (a || 0), 0)
   );
 
   // 4) credit amounts: bounded partition so total credits - total debits = target
-  const creditIdx = types
+  let creditIdx = types
     .map((ty, i) => (ty === "credit" ? i : -1))
     .filter((i) => i >= 0);
+
+  // Hard feasibility guarantee: with n credit slots capped at CREDIT_MAX
+  // each, the target is only reachable if n*CREDIT_MAX >= target+sumDebits.
+  // If not (very few slots, e.g. a short tail-end week), convert debit
+  // slots to credit — which helps twice: fewer debits to cover, more
+  // credit slots to cover them with — until it's provably reachable.
+  while (
+    creditIdx.length * CREDIT_MAX < round2(target + sumDebits) &&
+    types.includes("debit")
+  ) {
+    const debitIdx = types.findIndex((ty) => ty === "debit");
+    sumDebits = round2(sumDebits - debitAmounts[debitIdx]);
+    debitAmounts[debitIdx] = null;
+    types[debitIdx] = "credit";
+    creditIdx.push(debitIdx);
+  }
+
   const creditTargetSum = round2(target + sumDebits);
   const creditAmounts = partitionBounded(
     creditTargetSum,
@@ -326,8 +401,12 @@ function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
   ).run(`week_target_${weekStartKey}`, String(target));
 
   const actualCreditSum = round2(creditAmounts.reduce((s, a) => s + a, 0));
+  const scaleNote =
+    timeFraction < 0.999
+      ? ` (semana parcial, ${Math.round(timeFraction * 100)}% del tiempo — rango escalado a $${scaledMin}-$${scaledMax})`
+      : "";
   console.log(
-    `📅 Plan semanal generado: semana ${weekStartKey} (eventos desde ${planStart.toISOString()}) → objetivo neto $${target} ` +
+    `📅 Plan semanal generado: semana ${weekStartKey} (eventos desde ${planStart.toISOString()}) → objetivo neto $${target}${scaleNote} ` +
       `(créditos $${actualCreditSum} - débitos $${sumDebits} = $${round2(
         actualCreditSum - sumDebits
       )}), ${rows.length} eventos`
@@ -485,7 +564,53 @@ app.get("/api/events", (req, res) => {
   res.json(recentEvents.all(limit));
 });
 
+app.post("/api/withdraw", express.json(), (req, res) => {
+  const { address, amount } = req.body || {};
+
+  if (!address || typeof address !== "string") {
+    return res.status(400).json({ error: "La dirección es obligatoria." });
+  }
+  const trimmedAddress = address.trim();
+  if (!isValidSolanaAddress(trimmedAddress)) {
+    return res
+      .status(400)
+      .json({ error: "La dirección no tiene un formato válido de Solana." });
+  }
+
+  const amt = round2(parseFloat(amount));
+  if (isNaN(amt) || amt <= 0) {
+    return res.status(400).json({ error: "El monto debe ser mayor a 0." });
+  }
+
+  const wallet = getWallet.get();
+  if (amt > wallet.balance) {
+    return res.status(400).json({ error: "Saldo insuficiente para ese retiro." });
+  }
+
+  const newBalance = round2(wallet.balance - amt);
+  const now = new Date().toISOString();
+  const shortAddr = `${trimmedAddress.slice(0, 4)}…${trimmedAddress.slice(-4)}`;
+
+  updateWallet.run(newBalance, now);
+  insertEvent.run(now, "debit", amt, `Retiro a billetera — ${shortAddr}`, newBalance);
+  db.prepare(
+    "INSERT INTO withdrawals (ts, address, amount, balance_after) VALUES (?,?,?,?)"
+  ).run(now, trimmedAddress, amt, newBalance);
+
+  res.json({ ok: true, balance: newBalance, amount: amt, address: trimmedAddress });
+});
+
+app.get("/api/withdrawals", (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
+  res.json(
+    db
+      .prepare("SELECT * FROM withdrawals ORDER BY id DESC LIMIT ?")
+      .all(limit)
+  );
+});
+
 app.listen(PORT, () => {
   console.log(`Automaton simulation running on http://localhost:${PORT}`);
   console.log(`DB persisted at ${DB_PATH}`);
 });
+
