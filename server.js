@@ -1,3 +1,4 @@
+
 // ============================================================================
 // AUTOMATON — simulated live ledger backend
 // ----------------------------------------------------------------------------
@@ -45,6 +46,13 @@ const CREDIT_MAX = 25;
 const DEBIT_MIN = 0.1;
 const DEBIT_MAX = 5;
 const CREDIT_PROBABILITY = 0.55; // share of weekly slots typed as "credit"
+
+// Bot fleet: starts seeded at INITIAL_BOT_COUNT. From then on, every time
+// cumulative NET profit from task activity (credits - debits, withdrawals
+// don't count) advances by BOT_MILESTONE_USD, a new bot is added to the
+// fleet and the counter resets for the next one.
+const INITIAL_BOT_COUNT = 26;
+const BOT_MILESTONE_USD = 150;
 
 // Colombia is UTC-5 year-round (no DST) — used so "closes every Friday"
 // matches Juan's local week, regardless of the server's own timezone.
@@ -121,6 +129,11 @@ db.exec(`
     amount REAL NOT NULL,
     balance_after REAL NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS bots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -138,6 +151,25 @@ if (!bootRow) {
   db.prepare("INSERT INTO meta (key, value) VALUES ('boot_at', ?)").run(
     new Date().toISOString()
   );
+}
+
+// ---- seed initial bot fleet -------------------------------------------------
+const existingBotCount = db.prepare("SELECT COUNT(*) AS c FROM bots").get();
+if (existingBotCount.c === 0) {
+  const seedNow = new Date().toISOString();
+  const insertBot = db.prepare(
+    "INSERT INTO bots (label, created_at) VALUES (?, ?)"
+  );
+  const insertSeedBots = db.transaction((n) => {
+    for (let i = 1; i <= n; i++) {
+      insertBot.run(`BOT-${String(i).padStart(3, "0")}`, seedNow);
+    }
+  });
+  insertSeedBots(INITIAL_BOT_COUNT);
+  db.prepare(
+    "INSERT OR REPLACE INTO meta (key, value) VALUES ('bot_count', ?)"
+  ).run(String(INITIAL_BOT_COUNT));
+  console.log(`🤖 Sembrados ${INITIAL_BOT_COUNT} bots iniciales.`);
 }
 
 // ---- one-time reset via env var --------------------------------------------
@@ -419,6 +451,45 @@ function ensureCurrentWeekPlanned() {
 }
 
 // ---- delivering due events ---------------------------------------------------
+function createNewBot() {
+  const countRow = db
+    .prepare("SELECT value FROM meta WHERE key = 'bot_count'")
+    .get();
+  let count = countRow ? parseInt(countRow.value, 10) : INITIAL_BOT_COUNT;
+  count += 1;
+  const label = `BOT-${String(count).padStart(3, "0")}`;
+  const now = new Date().toISOString();
+  db.prepare("INSERT INTO bots (label, created_at) VALUES (?, ?)").run(
+    label,
+    now
+  );
+  db.prepare(
+    "INSERT OR REPLACE INTO meta (key, value) VALUES ('bot_count', ?)"
+  ).run(String(count));
+  console.log(
+    `🤖 Nuevo bot creado: ${label} (ganancia neta acumulada alcanzó un múltiplo de $${BOT_MILESTONE_USD})`
+  );
+}
+
+// Advances the running "net profit toward next bot" counter and creates as
+// many bots as the delta earns (handles a single large credit crossing
+// several $150 milestones at once). Only called for task credit/debit
+// events — withdrawals never touch this.
+function updateBotProgress(netDelta) {
+  const progressRow = db
+    .prepare("SELECT value FROM meta WHERE key = 'bot_progress_net'")
+    .get();
+  let progress = progressRow ? parseFloat(progressRow.value) : 0;
+  progress = round2(progress + netDelta);
+  while (progress >= BOT_MILESTONE_USD) {
+    progress = round2(progress - BOT_MILESTONE_USD);
+    createNewBot();
+  }
+  db.prepare(
+    "INSERT OR REPLACE INTO meta (key, value) VALUES ('bot_progress_net', ?)"
+  ).run(String(progress));
+}
+
 function recordEvent(type, amount, label) {
   const wallet = getWallet.get();
   const newBalance = round2(
@@ -427,6 +498,7 @@ function recordEvent(type, amount, label) {
   const now = new Date().toISOString();
   updateWallet.run(newBalance, now);
   insertEvent.run(now, type, amount, label, newBalance);
+  updateBotProgress(type === "credit" ? amount : -amount);
 }
 
 function deliverDuePlannedEvents() {
@@ -607,6 +679,22 @@ app.get("/api/withdrawals", (req, res) => {
       .prepare("SELECT * FROM withdrawals ORDER BY id DESC LIMIT ?")
       .all(limit)
   );
+});
+
+app.get("/api/bots", (req, res) => {
+  const countRow = db
+    .prepare("SELECT value FROM meta WHERE key = 'bot_count'")
+    .get();
+  const progressRow = db
+    .prepare("SELECT value FROM meta WHERE key = 'bot_progress_net'")
+    .get();
+  const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
+  res.json({
+    count: countRow ? parseInt(countRow.value, 10) : INITIAL_BOT_COUNT,
+    progress_to_next: progressRow ? parseFloat(progressRow.value) : 0,
+    milestone_usd: BOT_MILESTONE_USD,
+    bots: db.prepare("SELECT * FROM bots ORDER BY id DESC LIMIT ?").all(limit),
+  });
 });
 
 app.listen(PORT, () => {
