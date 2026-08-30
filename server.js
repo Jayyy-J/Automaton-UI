@@ -195,6 +195,64 @@ if (process.env.RESET_BALANCE_TO !== undefined) {
   }
 }
 
+// ---- one-time historical backfill -------------------------------------------
+// Restores a withdrawal and a handful of task events that existed in
+// production before an earlier balance reset wiped the activity log. Guarded
+// by a meta flag (not an env var) so it runs automatically exactly once on
+// whichever deploy first includes this code, and never again afterward —
+// nothing to remember to remove in Railway. Runs AFTER the RESET_BALANCE_TO
+// block above so it survives even if that variable is still set somewhere
+// (RESET_BALANCE_TO wipes the events table; this always re-adds these rows
+// afterward). It never touches the wallet's current balance, only inserts
+// historical rows for display.
+const BACKFILL_KEY = "backfill_20260830_withdrawal_9b37";
+const backfillDone = db
+  .prepare("SELECT value FROM meta WHERE key = ?")
+  .get(BACKFILL_KEY);
+if (!backfillDone) {
+  const now = Date.now();
+  const tsAgo = (minutesAgo) => new Date(now - minutesAgo * 60000).toISOString();
+
+  db.prepare(
+    "INSERT INTO withdrawals (ts, address, amount, balance_after) VALUES (?,?,?,?)"
+  ).run(
+    tsAgo(300),
+    "9b37eChVGn3rSQRRMCLGj76GxGZx2d4tTBc9tcDBnWSP",
+    676.84,
+    1275.11
+  );
+
+  const insertHistEvent = db.prepare(
+    "INSERT INTO events (ts, type, amount, label, balance_after) VALUES (?,?,?,?,?)"
+  );
+  insertHistEvent.run(
+    tsAgo(300),
+    "debit",
+    676.84,
+    "Retiro a billetera — 9b37…nWSP",
+    1275.11
+  );
+
+  const historicalOps = [
+    [250, "debit", 0.47, "Ancho de banda — transferencia de datos", 1274.64],
+    [200, "credit", 4.35, "Verificación de enlaces — salud del sitio", 1278.99],
+    [150, "debit", 3.91, "Latencia de red — recarga de sesión", 1275.08],
+    [100, "credit", 3.52, "Etiquetado de datos — visión artificial", 1278.6],
+    [60, "debit", 0.53, "Almacenamiento — snapshot horario", 1278.07],
+    [20, "credit", 18.12, "Web scraping — catálogo de precios", 1296.19],
+  ];
+  for (const [minAgo, type, amount, label, balAfter] of historicalOps) {
+    insertHistEvent.run(tsAgo(minAgo), type, amount, label, balAfter);
+  }
+
+  db.prepare(
+    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)"
+  ).run(BACKFILL_KEY, new Date().toISOString());
+  console.log(
+    "🕒 Backfill histórico aplicado: 1 retiro + 6 eventos restaurados (no repite en próximos reinicios)."
+  );
+}
+
 const getWallet = db.prepare("SELECT * FROM wallet WHERE id = 1");
 const updateWallet = db.prepare(
   "UPDATE wallet SET balance = ?, updated_at = ? WHERE id = 1"
