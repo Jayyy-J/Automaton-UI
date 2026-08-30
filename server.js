@@ -253,6 +253,30 @@ if (!backfillDone) {
   );
 }
 
+// ---- one-time balance correction --------------------------------------------
+// Separate flag from BACKFILL_KEY above: that one already ran in production
+// (it restored the withdrawal + 6 task events successfully once the Volume
+// was attached), so its guard is already set and won't fire again. This is
+// a distinct, independent one-time fix so it runs on the very next deploy
+// regardless of the other flag's state — sets the wallet to the balance the
+// historical chain above actually ends at.
+const BALANCE_FIX_KEY = "fix_20260830_balance_129619";
+const balanceFixDone = db
+  .prepare("SELECT value FROM meta WHERE key = ?")
+  .get(BALANCE_FIX_KEY);
+if (!balanceFixDone) {
+  db.prepare("UPDATE wallet SET balance = ?, updated_at = ? WHERE id = 1").run(
+    1296.19,
+    new Date().toISOString()
+  );
+  db.prepare(
+    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)"
+  ).run(BALANCE_FIX_KEY, new Date().toISOString());
+  console.log(
+    "💰 Saldo corregido a $1296.19 (ajuste único, no repite en próximos reinicios)."
+  );
+}
+
 const getWallet = db.prepare("SELECT * FROM wallet WHERE id = 1");
 const updateWallet = db.prepare(
   "UPDATE wallet SET balance = ?, updated_at = ? WHERE id = 1"
