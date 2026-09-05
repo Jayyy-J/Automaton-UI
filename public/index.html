@@ -66,6 +66,15 @@
     padding: 5px 10px; border-radius: 20px; letter-spacing: 0.05em;
     white-space: nowrap;
   }
+  .headerRight{ display:flex; flex-direction:column; align-items:flex-end; gap: 8px; }
+  .userEmail{ font-family:'IBM Plex Mono', monospace; font-size: 11px; color: var(--text-dim); }
+  #logoutBtn{
+    font-family:'IBM Plex Mono', monospace; font-size: 12px;
+    background: transparent; color: var(--text-dim);
+    border: 1px solid var(--line); padding: 6px 12px; border-radius: 4px;
+    cursor: pointer; transition: color 0.2s, border-color 0.2s;
+  }
+  #logoutBtn:hover{ color: var(--text); border-color: var(--text-dim); }
 
   .hero{
     display:flex; align-items:flex-end; justify-content: space-between; gap: 24px;
@@ -210,7 +219,11 @@
       </div>
       <div class="status-line" id="statusLine">inicializando…</div>
     </div>
-    <div class="badge">ENTORNO DE DATOS — datos generados automáticamente</div>
+    <div class="headerRight">
+      <div class="badge">ENTORNO DE DATOS — datos generados automáticamente</div>
+      <div class="userEmail" id="userEmail"></div>
+      <button id="logoutBtn">Cerrar sesión</button>
+    </div>
   </header>
 
   <div class="hero">
@@ -291,6 +304,28 @@ let history = [];
 let knownIds = new Set();
 let knownWithdrawalIds = new Set();
 
+function handleAuthFailure(res){
+  if(res.status === 401){
+    window.location.href = '/login';
+    return true;
+  }
+  return false;
+}
+
+async function loadMe(){
+  try{
+    const res = await fetch('/api/me');
+    if(handleAuthFailure(res)) return;
+    const data = await res.json();
+    $('userEmail').textContent = data.email;
+  }catch(e){ console.error(e); }
+}
+
+$('logoutBtn').addEventListener('click', async () => {
+  await fetch('/api/logout', { method: 'POST' });
+  window.location.href = '/login';
+});
+
 function drawECG(){
   const canvas = $('ecg');
   const ctx = canvas.getContext('2d');
@@ -337,6 +372,7 @@ function renderRow(ev){
 async function refreshStatus(){
   try{
     const res = await fetch('/api/status');
+    if(handleAuthFailure(res)) return;
     const s = await res.json();
 
     $('balance').textContent = fmt(s.balance);
@@ -524,6 +560,7 @@ async function doWithdraw(){
 
 $('withdrawBtn').addEventListener('click', doWithdraw);
 
+loadMe();
 tick();
 setInterval(tick, 3000);
 window.addEventListener('resize', drawECG);

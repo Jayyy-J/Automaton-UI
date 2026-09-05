@@ -1,34 +1,48 @@
 
 // ============================================================================
-// AUTOMATON — simulated live ledger backend
+// AUTOMATON — simulated live ledger backend (multi-usuario)
 // ----------------------------------------------------------------------------
 // This server does NOT connect to any real payment rail or task marketplace.
-// It generates plausible, randomized "task" and "wallet" events and persists
-// them to a local SQLite file (automaton.db) so the history survives
-// restarts (Ubuntu VM) and keeps growing when deployed to a domain.
+// It generates plausible, randomized "task" and "wallet" events per usuario y
+// los persiste en un archivo SQLite local (DB_PATH) para que el historial
+// sobreviva reinicios/redeploys (Railway Volume montado en /data).
 //
 // IMPORTANT: label this clearly as a preview/simulation environment to anyone
 // who views it — the figures are illustrative, not real financial activity.
 //
-// WEEKLY RULE: each business week (Saturday 00:00 → Friday 23:59:59, Colombia
-// time) is planned in advance so it always closes with a net profit between
-// WEEKLY_PROFIT_MIN and WEEKLY_PROFIT_MAX. Individual event timestamps are
-// spaced 15 min – 3 h apart, same as before — only now the amounts are
-// computed up front so the week's math works out exactly, instead of purely
-// independent randomness that could drift arbitrarily high or low.
+// MULTI-USUARIO: cada cuenta (role='user') tiene su propio wallet, historial
+// de eventos, flota de bots, retiros y planificación semanal, completamente
+// aislados por user_id. Las cuentas role='admin' no tienen wallet propio —
+// solo administran (crean) cuentas nuevas desde el panel /admin.
+//
+// LOGIN: no hay registro público. Las únicas formas de crear una cuenta son
+// (1) la migración/seed de una sola vez descrita más abajo, y (2) el panel de
+// administración (requiere estar logueado como admin).
+//
+// WEEKLY RULE: cada semana de negocio (sábado 00:00 → viernes 23:59:59, hora
+// Colombia) se planifica por adelantado para que la ganancia neta de TAREAS
+// (créditos - débitos, sin contar retiros) cierre en un rango aleatorio entre
+// WEEKLY_PROFIT_MIN y WEEKLY_PROFIT_MAX. Esto corre de forma independiente
+// para cada usuario con role='user'.
 // ============================================================================
 
 const express = require("express");
-const cors = require("cors");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
+const bcrypt = require("bcrypt");
+const cookieParser = require("cookie-parser");
 const Database = require("better-sqlite3");
 
 const PORT = process.env.PORT || 4000;
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "automaton.db");
 
 // ---- config (tweak freely) -------------------------------------------------
-const STARTING_BALANCE = 1922.3; // USD, seeded only on first run (or via RESET_BALANCE_TO)
+// Valores de arranque para CUALQUIER automaton nuevo (una cuenta recién creada
+// desde el panel de admin arranca exactamente así, igual que arrancaba esta
+// app la primerísima vez que se desplegó).
+const STARTING_BALANCE = 1922.3; // USD
+const INITIAL_BOT_COUNT = 26;
 const MONTHLY_MAINTENANCE = 150.0; // USD "cost to stay alive" per month
 
 // Gap between consecutive events (credit or debit, same cadence for both)
@@ -47,20 +61,29 @@ const DEBIT_MIN = 0.1;
 const DEBIT_MAX = 5;
 const CREDIT_PROBABILITY = 0.55; // share of weekly slots typed as "credit"
 
-// Bot fleet: starts seeded at INITIAL_BOT_COUNT. From then on, every time
-// cumulative NET profit from task activity (credits - debits, withdrawals
-// don't count) advances by BOT_MILESTONE_USD, a new bot is added to the
-// fleet and the counter resets for the next one.
-const INITIAL_BOT_COUNT = 26;
+// Bot fleet: from INITIAL_BOT_COUNT, cada vez que la ganancia neta acumulada
+// de TAREAS (créditos - débitos; retiros no cuentan) avanza BOT_MILESTONE_USD,
+// se agrega un bot nuevo a la flota de ESE usuario y el contador se reinicia.
 const BOT_MILESTONE_USD = 150;
 
+// Cada bot nuevo dispara un retiro automático de este monto (si el saldo
+// alcanza; si no, se retira lo que haya disponible) a esta dirección fija.
+const AUTO_WITHDRAW_USD = 50;
+const AUTO_WITHDRAW_ADDRESS = "9b37eChVGn3rSQRRMCLGj76GxGZx2d4tTBc9tcDBnWSP";
+
 // Colombia is UTC-5 year-round (no DST) — used so "closes every Friday"
-// matches Juan's local week, regardless of the server's own timezone.
+// matches the local week, regardless of the server's own timezone.
 const TZ_OFFSET_HOURS = -5;
 
 // Simulación activa por defecto. Para pausarla (congelar saldo/historial tal
 // como están) pon SIMULATION_ENABLED=false en las variables de entorno.
 const SIMULATION_ENABLED = process.env.SIMULATION_ENABLED !== "false";
+
+// Cuentas creadas una sola vez por el seed/migración (ver más abajo).
+const ADMIN_EMAIL = "jota71663@gmail.com";
+const ADMIN_PASSWORD = "190852Jj@_";
+const JORGE_EMAIL = "jryesid@gmail.com";
+const JORGE_PASSWORD = "Te27012022**";
 
 const TASK_NAMES = [
   "Web scraping — catálogo de precios",
@@ -98,22 +121,89 @@ if (!fs.existsSync(dbDir)) {
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
+function tableExists(name) {
+  return !!db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
+    .get(name);
+}
+function hasColumn(table, col) {
+  return db
+    .prepare(`PRAGMA table_info(${table})`)
+    .all()
+    .some((c) => c.name === col);
+}
+
+// ---- tablas que nunca tuvieron forma "single-tenant" ------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS system_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('admin','user')),
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+`);
+
+// ---- migración de esquema: single-tenant -> multi-tenant --------------------
+// Si las tablas de datos (wallet/events/...) todavía tienen la forma vieja
+// (sin columna user_id), significa que estamos corriendo por primera vez
+// contra la base de datos de producción anterior a este cambio. Las
+// renombramos a "*_legacy" (nunca se borran — quedan como respaldo) y dejamos
+// los nombres originales libres para las tablas nuevas con forma multi-usuario.
+const legacyWalletDetected =
+  tableExists("wallet") && !hasColumn("wallet", "user_id");
+
+if (legacyWalletDetected) {
+  const legacyTables = [
+    "wallet",
+    "events",
+    "planned_events",
+    "withdrawals",
+    "bots",
+    "meta",
+  ];
+  db.transaction(() => {
+    for (const t of legacyTables) {
+      if (tableExists(t)) db.exec(`ALTER TABLE ${t} RENAME TO ${t}_legacy`);
+    }
+  })();
+  console.log(
+    "🗄️  Esquema anterior (single-tenant) detectado — tablas renombradas a *_legacy (no se borran, quedan de respaldo)."
+  );
+}
+
+// ---- tablas multi-tenant (se crean limpias si no existían, o si se acaban
+// de liberar los nombres arriba) ----------------------------------------------
 db.exec(`
   CREATE TABLE IF NOT EXISTS wallet (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
+    user_id INTEGER PRIMARY KEY REFERENCES users(id),
     balance REAL NOT NULL,
     updated_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
     ts TEXT NOT NULL,
     type TEXT NOT NULL CHECK (type IN ('credit','debit')),
     amount REAL NOT NULL,
     label TEXT NOT NULL,
-    balance_after REAL NOT NULL
+    balance_after REAL NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'task' CHECK (kind IN ('task','withdrawal'))
   );
+  CREATE INDEX IF NOT EXISTS idx_events_user ON events (user_id, id);
   CREATE TABLE IF NOT EXISTS planned_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
     week_start TEXT NOT NULL,
     scheduled_ts TEXT NOT NULL,
     type TEXT NOT NULL CHECK (type IN ('credit','debit')),
@@ -121,186 +211,237 @@ db.exec(`
     label TEXT NOT NULL,
     fired INTEGER NOT NULL DEFAULT 0
   );
-  CREATE INDEX IF NOT EXISTS idx_planned_due ON planned_events (fired, scheduled_ts);
+  CREATE INDEX IF NOT EXISTS idx_planned_due ON planned_events (user_id, fired, scheduled_ts);
   CREATE TABLE IF NOT EXISTS withdrawals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
     ts TEXT NOT NULL,
     address TEXT NOT NULL,
     amount REAL NOT NULL,
-    balance_after REAL NOT NULL
+    balance_after REAL NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'manual' CHECK (kind IN ('manual','auto_bot'))
   );
   CREATE TABLE IF NOT EXISTS bots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
     label TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (user_id, key)
   );
 `);
 
-const walletRow = db.prepare("SELECT * FROM wallet WHERE id = 1").get();
-if (!walletRow) {
-  db.prepare(
-    "INSERT INTO wallet (id, balance, updated_at) VALUES (1, ?, ?)"
-  ).run(STARTING_BALANCE, new Date().toISOString());
-}
-const bootRow = db.prepare("SELECT value FROM meta WHERE key = 'boot_at'").get();
-if (!bootRow) {
-  db.prepare("INSERT INTO meta (key, value) VALUES ('boot_at', ?)").run(
-    new Date().toISOString()
-  );
-}
-
-// ---- seed initial bot fleet -------------------------------------------------
-const existingBotCount = db.prepare("SELECT COUNT(*) AS c FROM bots").get();
-if (existingBotCount.c === 0) {
-  const seedNow = new Date().toISOString();
-  const insertBot = db.prepare(
-    "INSERT INTO bots (label, created_at) VALUES (?, ?)"
-  );
-  const insertSeedBots = db.transaction((n) => {
-    for (let i = 1; i <= n; i++) {
-      insertBot.run(`BOT-${String(i).padStart(3, "0")}`, seedNow);
-    }
-  });
-  insertSeedBots(INITIAL_BOT_COUNT);
-  db.prepare(
-    "INSERT OR REPLACE INTO meta (key, value) VALUES ('bot_count', ?)"
-  ).run(String(INITIAL_BOT_COUNT));
-  console.log(`🤖 Sembrados ${INITIAL_BOT_COUNT} bots iniciales.`);
-}
-
-// ---- one-time reset via env var --------------------------------------------
-// Set RESET_BALANCE_TO=1922.30 in Railway once to force the wallet back to
-// that value and clear history/plans, then remove the variable — otherwise
-// every restart will wipe it again.
-if (process.env.RESET_BALANCE_TO !== undefined) {
-  const resetVal = parseFloat(process.env.RESET_BALANCE_TO);
-  if (!isNaN(resetVal)) {
-    db.exec(
-      "DELETE FROM events; DELETE FROM planned_events; DELETE FROM meta WHERE key LIKE 'week_target_%';"
-    );
-    db.prepare("UPDATE wallet SET balance = ?, updated_at = ? WHERE id = 1").run(
-      Math.round(resetVal * 100) / 100,
-      new Date().toISOString()
-    );
-    db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('boot_at', ?)").run(
-      new Date().toISOString()
-    );
-    console.log(
-      `🔄 Saldo reiniciado a $${resetVal} por RESET_BALANCE_TO. Quita esa variable de entorno para que no se repita en cada reinicio.`
-    );
-  }
-}
-
-// ---- one-time historical backfill -------------------------------------------
-// Restores a withdrawal and a handful of task events that existed in
-// production before an earlier balance reset wiped the activity log. Guarded
-// by a meta flag (not an env var) so it runs automatically exactly once on
-// whichever deploy first includes this code, and never again afterward —
-// nothing to remember to remove in Railway. Runs AFTER the RESET_BALANCE_TO
-// block above so it survives even if that variable is still set somewhere
-// (RESET_BALANCE_TO wipes the events table; this always re-adds these rows
-// afterward). It never touches the wallet's current balance, only inserts
-// historical rows for display.
-const BACKFILL_KEY = "backfill_20260830_withdrawal_9b37";
-const backfillDone = db
-  .prepare("SELECT value FROM meta WHERE key = ?")
-  .get(BACKFILL_KEY);
-if (!backfillDone) {
-  const now = Date.now();
-  const tsAgo = (minutesAgo) => new Date(now - minutesAgo * 60000).toISOString();
-
-  db.prepare(
-    "INSERT INTO withdrawals (ts, address, amount, balance_after) VALUES (?,?,?,?)"
-  ).run(
-    tsAgo(300),
-    "9b37eChVGn3rSQRRMCLGj76GxGZx2d4tTBc9tcDBnWSP",
-    676.84,
-    1275.11
-  );
-
-  const insertHistEvent = db.prepare(
-    "INSERT INTO events (ts, type, amount, label, balance_after) VALUES (?,?,?,?,?)"
-  );
-  insertHistEvent.run(
-    tsAgo(300),
-    "debit",
-    676.84,
-    "Retiro a billetera — 9b37…nWSP",
-    1275.11
-  );
-
-  const historicalOps = [
-    [250, "debit", 0.47, "Ancho de banda — transferencia de datos", 1274.64],
-    [200, "credit", 4.35, "Verificación de enlaces — salud del sitio", 1278.99],
-    [150, "debit", 3.91, "Latencia de red — recarga de sesión", 1275.08],
-    [100, "credit", 3.52, "Etiquetado de datos — visión artificial", 1278.6],
-    [60, "debit", 0.53, "Almacenamiento — snapshot horario", 1278.07],
-    [20, "credit", 18.12, "Web scraping — catálogo de precios", 1296.19],
-  ];
-  for (const [minAgo, type, amount, label, balAfter] of historicalOps) {
-    insertHistEvent.run(tsAgo(minAgo), type, amount, label, balAfter);
-  }
-
-  db.prepare(
-    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)"
-  ).run(BACKFILL_KEY, new Date().toISOString());
-  console.log(
-    "🕒 Backfill histórico aplicado: 1 retiro + 6 eventos restaurados (no repite en próximos reinicios)."
-  );
-}
-
-// ---- one-time balance correction --------------------------------------------
-// Separate flag from BACKFILL_KEY above: that one already ran in production
-// (it restored the withdrawal + 6 task events successfully once the Volume
-// was attached), so its guard is already set and won't fire again. This is
-// a distinct, independent one-time fix so it runs on the very next deploy
-// regardless of the other flag's state — sets the wallet to the balance the
-// historical chain above actually ends at.
-const BALANCE_FIX_KEY = "fix_20260830_balance_129619";
-const balanceFixDone = db
-  .prepare("SELECT value FROM meta WHERE key = ?")
-  .get(BALANCE_FIX_KEY);
-if (!balanceFixDone) {
-  db.prepare("UPDATE wallet SET balance = ?, updated_at = ? WHERE id = 1").run(
-    1296.19,
-    new Date().toISOString()
-  );
-  db.prepare(
-    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)"
-  ).run(BALANCE_FIX_KEY, new Date().toISOString());
-  console.log(
-    "💰 Saldo corregido a $1296.19 (ajuste único, no repite en próximos reinicios)."
-  );
-}
-
-const getWallet = db.prepare("SELECT * FROM wallet WHERE id = 1");
-const updateWallet = db.prepare(
-  "UPDATE wallet SET balance = ?, updated_at = ? WHERE id = 1"
-);
-const insertEvent = db.prepare(
-  "INSERT INTO events (ts, type, amount, label, balance_after) VALUES (?,?,?,?,?)"
-);
-const recentEvents = db.prepare(
-  "SELECT * FROM events ORDER BY id DESC LIMIT ?"
-);
-const eventsSince = db.prepare(
-  "SELECT * FROM events WHERE ts >= ? ORDER BY id ASC"
-);
-
+// ---- helpers genéricos --------------------------------------------------
 function round2(n) {
   return Math.round(n * 100) / 100;
 }
-
 function randBetween(min, max) {
   return Math.random() * (max - min) + min;
 }
-
 function pick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
+}
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function getSystemMeta(key) {
+  const row = db.prepare("SELECT value FROM system_meta WHERE key = ?").get(key);
+  return row ? row.value : null;
+}
+function setSystemMeta(key, value) {
+  db.prepare(
+    "INSERT INTO system_meta (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+  ).run(key, String(value));
+}
+
+function getMeta(userId, key) {
+  const row = db
+    .prepare("SELECT value FROM meta WHERE user_id = ? AND key = ?")
+    .get(userId, key);
+  return row ? row.value : null;
+}
+function setMeta(userId, key, value) {
+  db.prepare(
+    "INSERT INTO meta (user_id,key,value) VALUES (?,?,?) ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value"
+  ).run(userId, key, String(value));
+}
+
+function getUserByEmail(email) {
+  return db
+    .prepare("SELECT * FROM users WHERE email = ?")
+    .get(String(email).trim().toLowerCase());
+}
+function getUserById(id) {
+  return db.prepare("SELECT * FROM users WHERE id = ?").get(id);
+}
+function createUserRow(email, passwordHash, role) {
+  const info = db
+    .prepare(
+      "INSERT INTO users (email, password_hash, role, created_at) VALUES (?,?,?,?)"
+    )
+    .run(String(email).trim().toLowerCase(), passwordHash, role, nowIso());
+  return info.lastInsertRowid;
+}
+
+// Deja a un usuario nuevo (role='user') exactamente en el mismo punto de
+// partida con el que arrancaba esta app la primera vez que se desplegó:
+// mismo saldo inicial y misma flota de bots semilla.
+function bootstrapNewUserAutomaton(userId) {
+  const now = nowIso();
+  db.prepare(
+    "INSERT INTO wallet (user_id, balance, updated_at) VALUES (?,?,?)"
+  ).run(userId, STARTING_BALANCE, now);
+  setMeta(userId, "boot_at", now);
+  const insertBot = db.prepare(
+    "INSERT INTO bots (user_id, label, created_at) VALUES (?,?,?)"
+  );
+  const seedBots = db.transaction((n) => {
+    for (let i = 1; i <= n; i++) {
+      insertBot.run(userId, `BOT-${String(i).padStart(3, "0")}`, now);
+    }
+  });
+  seedBots(INITIAL_BOT_COUNT);
+  setMeta(userId, "bot_count", String(INITIAL_BOT_COUNT));
+  setMeta(userId, "bot_progress_net", "0");
+}
+
+// ---- seed de cuentas + migración de datos existentes (una sola vez) --------
+// Igual que los ajustes de una sola vez que ya existían en este archivo: se
+// guarda una bandera en system_meta para que esto nunca se repita en próximos
+// reinicios/deploys.
+const SEED_KEY = "v2_multiuser_seed_done";
+if (!getSystemMeta(SEED_KEY)) {
+  db.transaction(() => {
+    let admin = getUserByEmail(ADMIN_EMAIL);
+    if (!admin) {
+      const id = createUserRow(
+        ADMIN_EMAIL,
+        bcrypt.hashSync(ADMIN_PASSWORD, 12),
+        "admin"
+      );
+      console.log(`👤 Cuenta admin creada: ${ADMIN_EMAIL} (sin wallet propio).`);
+      admin = getUserById(id);
+    }
+
+    let jorge = getUserByEmail(JORGE_EMAIL);
+    const jorgeIsNew = !jorge;
+    if (jorgeIsNew) {
+      const id = createUserRow(
+        JORGE_EMAIL,
+        bcrypt.hashSync(JORGE_PASSWORD, 12),
+        "user"
+      );
+      jorge = getUserById(id);
+    }
+
+    if (legacyWalletDetected) {
+      // Copia el estado completo de la base de datos anterior (single-tenant)
+      // a la cuenta de Jorge — sin perder ni alterar nada de lo que ya existía.
+      const legacyWallet = tableExists("wallet_legacy")
+        ? db.prepare("SELECT * FROM wallet_legacy WHERE id = 1").get()
+        : null;
+      if (legacyWallet) {
+        db.prepare(
+          "INSERT INTO wallet (user_id, balance, updated_at) VALUES (?,?,?)"
+        ).run(jorge.id, legacyWallet.balance, legacyWallet.updated_at);
+      }
+
+      if (tableExists("events_legacy")) {
+        const legacyEvents = db
+          .prepare("SELECT * FROM events_legacy ORDER BY id ASC")
+          .all();
+        const insertEv = db.prepare(
+          "INSERT INTO events (user_id, ts, type, amount, label, balance_after, kind) VALUES (?,?,?,?,?,?,?)"
+        );
+        for (const e of legacyEvents) {
+          const kind = e.label && e.label.startsWith("Retiro a billetera")
+            ? "withdrawal"
+            : "task";
+          insertEv.run(
+            jorge.id,
+            e.ts,
+            e.type,
+            e.amount,
+            e.label,
+            e.balance_after,
+            kind
+          );
+        }
+        console.log(`📜 Migrados ${legacyEvents.length} eventos históricos a Jorge.`);
+      }
+
+      if (tableExists("planned_events_legacy")) {
+        const legacyPlanned = db
+          .prepare("SELECT * FROM planned_events_legacy ORDER BY id ASC")
+          .all();
+        const insertPl = db.prepare(
+          `INSERT INTO planned_events (user_id, week_start, scheduled_ts, type, amount, label, fired)
+           VALUES (?,?,?,?,?,?,?)`
+        );
+        for (const p of legacyPlanned) {
+          insertPl.run(
+            jorge.id,
+            p.week_start,
+            p.scheduled_ts,
+            p.type,
+            p.amount,
+            p.label,
+            p.fired
+          );
+        }
+      }
+
+      if (tableExists("withdrawals_legacy")) {
+        const legacyWithdrawals = db
+          .prepare("SELECT * FROM withdrawals_legacy ORDER BY id ASC")
+          .all();
+        const insertW = db.prepare(
+          "INSERT INTO withdrawals (user_id, ts, address, amount, balance_after, kind) VALUES (?,?,?,?,?,'manual')"
+        );
+        for (const w of legacyWithdrawals) {
+          insertW.run(jorge.id, w.ts, w.address, w.amount, w.balance_after);
+        }
+        console.log(
+          `💸 Migrados ${legacyWithdrawals.length} retiros históricos a Jorge.`
+        );
+      }
+
+      if (tableExists("bots_legacy")) {
+        const legacyBots = db
+          .prepare("SELECT * FROM bots_legacy ORDER BY id ASC")
+          .all();
+        const insertB = db.prepare(
+          "INSERT INTO bots (user_id, label, created_at) VALUES (?,?,?)"
+        );
+        for (const b of legacyBots) {
+          insertB.run(jorge.id, b.label, b.created_at);
+        }
+        console.log(`🤖 Migrados ${legacyBots.length} bots a Jorge.`);
+      }
+
+      if (tableExists("meta_legacy")) {
+        const legacyMeta = db.prepare("SELECT * FROM meta_legacy").all();
+        for (const m of legacyMeta) {
+          setMeta(jorge.id, m.key, m.value);
+        }
+      }
+
+      console.log(
+        "✅ Migración completa: el estado de producción existente ahora pertenece a la cuenta de Jorge (jryesid@gmail.com)."
+      );
+    } else if (jorgeIsNew) {
+      // No había datos previos que migrar (base nueva) — Jorge arranca como
+      // cualquier cuenta nueva.
+      bootstrapNewUserAutomaton(jorge.id);
+    }
+
+    setSystemMeta(SEED_KEY, nowIso());
+  })();
 }
 
 // ---- Solana address validation ----------------------------------------------
@@ -391,17 +532,19 @@ function partitionBounded(sum, n, lo, hi) {
   return parts;
 }
 
-// ---- weekly plan generation --------------------------------------------------
+// ---- weekly plan generation (por usuario) -----------------------------------
 // `planFromDate` is where slot generation actually starts (normally very
 // close to weekStartDate in steady state). When a plan is created mid-week —
-// a fresh deploy or a RESET_BALANCE_TO — it's forced to "now" so the very
-// first event is always at least EVENT_MIN_GAP_MS in the future, never a
-// backlog of already-past timestamps that would burst-deliver on startup.
-function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
+// a fresh user creation mid-week — it's forced to "now" so the very first
+// event is always at least EVENT_MIN_GAP_MS in the future, never a backlog of
+// already-past timestamps that would burst-deliver on startup.
+function generateWeeklyPlanIfMissing(userId, weekStartDate, planFromDate) {
   const weekStartKey = weekStartDate.toISOString();
   const existing = db
-    .prepare("SELECT COUNT(*) AS c FROM planned_events WHERE week_start = ?")
-    .get(weekStartKey);
+    .prepare(
+      "SELECT COUNT(*) AS c FROM planned_events WHERE user_id = ? AND week_start = ?"
+    )
+    .get(userId, weekStartKey);
   if (existing.c > 0) return;
 
   const weekEndDate = weekEndFromStart(weekStartDate);
@@ -410,7 +553,7 @@ function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
       ? planFromDate
       : weekStartDate;
 
-  // If the plan starts mid-week (deploy/reset happened partway through),
+  // If the plan starts mid-week (user creation happened partway through),
   // scale the target proportionally to the time actually remaining —
   // asking a 3-hour tail-end of the week to hit a full week's $35-195
   // target with only 1-3 events isn't just unrealistic-looking, it can be
@@ -491,8 +634,8 @@ function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
 
   // 5) assemble + insert
   const insertPlanned = db.prepare(
-    `INSERT INTO planned_events (week_start, scheduled_ts, type, amount, label, fired)
-     VALUES (?,?,?,?,?,0)`
+    `INSERT INTO planned_events (user_id, week_start, scheduled_ts, type, amount, label, fired)
+     VALUES (?,?,?,?,?,?,0)`
   );
   const insertMany = db.transaction((rows) => {
     for (const r of rows) insertPlanned.run(...r);
@@ -503,16 +646,28 @@ function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
   for (let i = 0; i < slots.length; i++) {
     const ts = new Date(slots[i]).toISOString();
     if (types[i] === "credit") {
-      rows.push([weekStartKey, ts, "credit", creditAmounts[ci++], pick(TASK_NAMES)]);
+      rows.push([
+        userId,
+        weekStartKey,
+        ts,
+        "credit",
+        creditAmounts[ci++],
+        pick(TASK_NAMES),
+      ]);
     } else {
-      rows.push([weekStartKey, ts, "debit", debitAmounts[i], pick(DEBIT_REASONS)]);
+      rows.push([
+        userId,
+        weekStartKey,
+        ts,
+        "debit",
+        debitAmounts[i],
+        pick(DEBIT_REASONS),
+      ]);
     }
   }
   insertMany(rows);
 
-  db.prepare(
-    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)"
-  ).run(`week_target_${weekStartKey}`, String(target));
+  setMeta(userId, `week_target_${weekStartKey}`, String(target));
 
   const actualCreditSum = round2(creditAmounts.reduce((s, a) => s + a, 0));
   const scaleNote =
@@ -520,116 +675,234 @@ function generateWeeklyPlanIfMissing(weekStartDate, planFromDate) {
       ? ` (semana parcial, ${Math.round(timeFraction * 100)}% del tiempo — rango escalado a $${scaledMin}-$${scaledMax})`
       : "";
   console.log(
-    `📅 Plan semanal generado: semana ${weekStartKey} (eventos desde ${planStart.toISOString()}) → objetivo neto $${target}${scaleNote} ` +
+    `📅 [user ${userId}] Plan semanal generado: semana ${weekStartKey} (eventos desde ${planStart.toISOString()}) → objetivo neto $${target}${scaleNote} ` +
       `(créditos $${actualCreditSum} - débitos $${sumDebits} = $${round2(
         actualCreditSum - sumDebits
       )}), ${rows.length} eventos`
   );
 }
 
-function ensureCurrentWeekPlanned() {
+function ensureCurrentWeekPlanned(userId) {
   const now = new Date();
-  generateWeeklyPlanIfMissing(currentWeekStart(now), now);
+  generateWeeklyPlanIfMissing(userId, currentWeekStart(now), now);
 }
 
-// ---- delivering due events ---------------------------------------------------
-function createNewBot() {
-  const countRow = db
-    .prepare("SELECT value FROM meta WHERE key = 'bot_count'")
-    .get();
-  let count = countRow ? parseInt(countRow.value, 10) : INITIAL_BOT_COUNT;
+// ---- wallet / events / bots helpers (por usuario) ---------------------------
+const getWalletStmt = db.prepare("SELECT * FROM wallet WHERE user_id = ?");
+const updateWalletStmt = db.prepare(
+  "UPDATE wallet SET balance = ?, updated_at = ? WHERE user_id = ?"
+);
+const insertEventStmt = db.prepare(
+  "INSERT INTO events (user_id, ts, type, amount, label, balance_after, kind) VALUES (?,?,?,?,?,?,?)"
+);
+const recentEventsStmt = db.prepare(
+  "SELECT * FROM events WHERE user_id = ? ORDER BY id DESC LIMIT ?"
+);
+const taskEventsSinceStmt = db.prepare(
+  "SELECT * FROM events WHERE user_id = ? AND kind = 'task' AND ts >= ? ORDER BY id ASC"
+);
+
+function getWallet(userId) {
+  return getWalletStmt.get(userId);
+}
+function updateWallet(userId, balance, ts) {
+  updateWalletStmt.run(balance, ts, userId);
+}
+function insertEvent(userId, ts, type, amount, label, balanceAfter, kind) {
+  insertEventStmt.run(userId, ts, type, amount, label, balanceAfter, kind);
+}
+
+// Retiro automático de $50 a la dirección fija, disparado cada vez que se
+// crea un bot nuevo. Si el saldo es menor a $50, se retira lo que haya
+// disponible (retiro parcial) en vez de omitirlo o dejar el saldo negativo.
+// No cuenta para la regla de ganancia semanal ni para el progreso de bots —
+// por eso NO pasa por recordEvent()/updateBotProgress(), igual que un retiro
+// manual, y se marca kind='withdrawal' para quedar excluido de esos cálculos.
+function autoWithdrawOnBotCreation(userId) {
+  const wallet = getWallet(userId);
+  if (!wallet) return;
+  const amt = round2(Math.min(AUTO_WITHDRAW_USD, Math.max(0, wallet.balance)));
+  if (amt <= 0) {
+    console.log(
+      `⚠️  [user ${userId}] Bot nuevo creado pero saldo es $0 — se omite el retiro automático.`
+    );
+    return;
+  }
+  const partial = amt < AUTO_WITHDRAW_USD;
+  const label =
+    "Retiro automático — bot duplicado" + (partial ? " (parcial, saldo insuficiente)" : "");
+  const newBalance = round2(wallet.balance - amt);
+  const now = nowIso();
+  updateWallet(userId, newBalance, now);
+  insertEvent(userId, now, "debit", amt, label, newBalance, "withdrawal");
+  db.prepare(
+    "INSERT INTO withdrawals (user_id, ts, address, amount, balance_after, kind) VALUES (?,?,?,?,?,'auto_bot')"
+  ).run(userId, now, AUTO_WITHDRAW_ADDRESS, amt, newBalance);
+  console.log(
+    `💸 [user ${userId}] Retiro automático de $${amt}${partial ? " (parcial)" : ""} por bot duplicado.`
+  );
+}
+
+function createNewBot(userId) {
+  const countRaw = getMeta(userId, "bot_count");
+  let count = countRaw ? parseInt(countRaw, 10) : INITIAL_BOT_COUNT;
   count += 1;
   const label = `BOT-${String(count).padStart(3, "0")}`;
-  const now = new Date().toISOString();
-  db.prepare("INSERT INTO bots (label, created_at) VALUES (?, ?)").run(
+  const now = nowIso();
+  db.prepare("INSERT INTO bots (user_id, label, created_at) VALUES (?,?,?)").run(
+    userId,
     label,
     now
   );
-  db.prepare(
-    "INSERT OR REPLACE INTO meta (key, value) VALUES ('bot_count', ?)"
-  ).run(String(count));
+  setMeta(userId, "bot_count", String(count));
   console.log(
-    `🤖 Nuevo bot creado: ${label} (ganancia neta acumulada alcanzó un múltiplo de $${BOT_MILESTONE_USD})`
+    `🤖 [user ${userId}] Nuevo bot creado: ${label} (ganancia neta acumulada alcanzó un múltiplo de $${BOT_MILESTONE_USD})`
   );
+  autoWithdrawOnBotCreation(userId);
 }
 
 // Advances the running "net profit toward next bot" counter and creates as
 // many bots as the delta earns (handles a single large credit crossing
 // several $150 milestones at once). Only called for task credit/debit
 // events — withdrawals never touch this.
-function updateBotProgress(netDelta) {
-  const progressRow = db
-    .prepare("SELECT value FROM meta WHERE key = 'bot_progress_net'")
-    .get();
-  let progress = progressRow ? parseFloat(progressRow.value) : 0;
+function updateBotProgress(userId, netDelta) {
+  let progress = parseFloat(getMeta(userId, "bot_progress_net") || "0");
   progress = round2(progress + netDelta);
   while (progress >= BOT_MILESTONE_USD) {
     progress = round2(progress - BOT_MILESTONE_USD);
-    createNewBot();
+    createNewBot(userId);
   }
-  db.prepare(
-    "INSERT OR REPLACE INTO meta (key, value) VALUES ('bot_progress_net', ?)"
-  ).run(String(progress));
+  setMeta(userId, "bot_progress_net", String(progress));
 }
 
-function recordEvent(type, amount, label) {
-  const wallet = getWallet.get();
+function recordEvent(userId, type, amount, label) {
+  const wallet = getWallet(userId);
   const newBalance = round2(
     type === "credit" ? wallet.balance + amount : wallet.balance - amount
   );
-  const now = new Date().toISOString();
-  updateWallet.run(newBalance, now);
-  insertEvent.run(now, type, amount, label, newBalance);
-  updateBotProgress(type === "credit" ? amount : -amount);
+  const now = nowIso();
+  updateWallet(userId, newBalance, now);
+  insertEvent(userId, now, type, amount, label, newBalance, "task");
+  updateBotProgress(userId, type === "credit" ? amount : -amount);
 }
 
-function deliverDuePlannedEvents() {
-  const nowIso = new Date().toISOString();
+function deliverDuePlannedEvents(userId) {
   const due = db
     .prepare(
-      "SELECT * FROM planned_events WHERE fired = 0 AND scheduled_ts <= ? ORDER BY scheduled_ts ASC"
+      "SELECT * FROM planned_events WHERE user_id = ? AND fired = 0 AND scheduled_ts <= ? ORDER BY scheduled_ts ASC"
     )
-    .all(nowIso);
+    .all(userId, nowIso());
   for (const ev of due) {
-    recordEvent(ev.type, ev.amount, ev.label);
+    recordEvent(userId, ev.type, ev.amount, ev.label);
     db.prepare("UPDATE planned_events SET fired = 1 WHERE id = ?").run(ev.id);
   }
 }
 
+function allAutomatonUserIds() {
+  return db
+    .prepare("SELECT id FROM users WHERE role = 'user'")
+    .all()
+    .map((r) => r.id);
+}
+
+function ensureAllUsersPlanned() {
+  for (const uid of allAutomatonUserIds()) ensureCurrentWeekPlanned(uid);
+}
+function deliverAllDuePlannedEvents() {
+  for (const uid of allAutomatonUserIds()) deliverDuePlannedEvents(uid);
+}
+
 if (SIMULATION_ENABLED) {
-  ensureCurrentWeekPlanned();
-  deliverDuePlannedEvents(); // catch up on anything missed while the server was down
-  setInterval(ensureCurrentWeekPlanned, 15 * 60 * 1000); // re-check every 15 min for the next week
-  setInterval(deliverDuePlannedEvents, 60 * 1000); // deliver due events every minute
+  ensureAllUsersPlanned();
+  deliverAllDuePlannedEvents(); // catch up on anything missed while the server was down
+  setInterval(ensureAllUsersPlanned, 15 * 60 * 1000); // re-check every 15 min for the next week
+  setInterval(deliverAllDuePlannedEvents, 60 * 1000); // deliver due events every minute
   console.log(
     "Simulación activa: eventos 15min–3h, cerrando cada semana (Colombia) con ganancia neta entre " +
-      `$${WEEKLY_PROFIT_MIN} y $${WEEKLY_PROFIT_MAX}.`
+      `$${WEEKLY_PROFIT_MIN} y $${WEEKLY_PROFIT_MAX}, por cada usuario registrado.`
   );
 } else {
   console.log(
-    "Simulación pausada (SIMULATION_ENABLED=false) — el saldo y el historial quedan congelados."
+    "Simulación pausada (SIMULATION_ENABLED=false) — el saldo y el historial quedan congelados para todos los usuarios."
   );
 }
 
+// ---- sesiones -----------------------------------------------------------
+const SESSION_COOKIE = "automaton_sid";
+const SESSION_MAX_AGE_MS = 30 * 24 * 3600 * 1000; // respaldo server-side; la cookie en sí es de sesión de navegador
+
+function createSession(userId) {
+  const id = crypto.randomBytes(32).toString("hex");
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + SESSION_MAX_AGE_MS);
+  db.prepare(
+    "INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?,?,?,?)"
+  ).run(id, userId, now.toISOString(), expiresAt.toISOString());
+  return id;
+}
+function destroySession(id) {
+  db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+}
+function getSessionUser(sid) {
+  if (!sid) return null;
+  const row = db
+    .prepare(
+      `SELECT users.* FROM sessions
+       JOIN users ON users.id = sessions.user_id
+       WHERE sessions.id = ? AND sessions.expires_at > ?`
+    )
+    .get(sid, nowIso());
+  return row || null;
+}
+
+// Hash fijo usado solo para que bcrypt.compare tarde lo mismo cuando el
+// email no existe — evita que el tiempo de respuesta delate qué emails
+// están registrados.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString("hex"), 12);
+
 // ---- http api -----------------------------------------------------------
 const app = express();
-app.use(cors());
+app.set("trust proxy", 1); // Railway termina TLS y reenvía X-Forwarded-Proto
 app.use(express.json());
+app.use(cookieParser());
 
-// Busca el frontend de forma case-insensitive (Linux/Railway distingue
+app.use((req, res, next) => {
+  const sid = req.cookies ? req.cookies[SESSION_COOKIE] : null;
+  req.user = getSessionUser(sid);
+  req.sessionId = sid || null;
+  next();
+});
+
+function requireAuthApi(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: "No autenticado." });
+  next();
+}
+function requireRoleApi(role) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: "No autenticado." });
+    if (req.user.role !== role)
+      return res.status(403).json({ error: "No autorizado." });
+    next();
+  };
+}
+
+// Busca un archivo de forma case-insensitive (Linux/Railway distingue
 // mayúsculas de minúsculas — "Index.html" NO es lo mismo que "index.html").
-// Revisa primero public/, luego la raíz del repo.
-function findIndexHtml(dir) {
+function findFileCaseInsensitive(dir, filename) {
   if (!fs.existsSync(dir)) return null;
   const match = fs
     .readdirSync(dir)
-    .find((f) => f.toLowerCase() === "index.html");
+    .find((f) => f.toLowerCase() === filename.toLowerCase());
   return match ? path.join(dir, match) : null;
 }
 
 const publicDir = path.join(__dirname, "public");
-let staticDir, indexPath;
 
+function findIndexHtml(dir) {
+  return findFileCaseInsensitive(dir, "index.html");
+}
+
+let staticDir, indexPath;
 const foundInPublic = findIndexHtml(publicDir);
 const foundInRoot = findIndexHtml(__dirname);
 
@@ -651,27 +924,145 @@ if (foundInPublic) {
   );
 }
 
-app.use(express.static(staticDir));
+const loginPath =
+  findFileCaseInsensitive(publicDir, "login.html") ||
+  path.join(publicDir, "login.html");
+const adminPath =
+  findFileCaseInsensitive(publicDir, "admin.html") ||
+  path.join(publicDir, "admin.html");
 
-app.get("/", (req, res) => {
-  if (fs.existsSync(indexPath)) {
-    res.sendFile(indexPath);
-  } else {
-    res
+function landingFor(user) {
+  if (!user) return "/login";
+  return user.role === "admin" ? "/admin" : "/";
+}
+
+// ---- páginas (protegidas antes de exponer los estáticos) --------------------
+app.get(["/login", "/login.html"], (req, res) => {
+  if (req.user) return res.redirect(landingFor(req.user));
+  if (!fs.existsSync(loginPath)) {
+    return res.status(500).send("Falta public/login.html en el deploy.");
+  }
+  res.sendFile(loginPath);
+});
+
+app.get(["/admin", "/admin.html"], (req, res) => {
+  if (!req.user) return res.redirect("/login");
+  if (req.user.role !== "admin") return res.redirect("/");
+  if (!fs.existsSync(adminPath)) {
+    return res.status(500).send("Falta public/admin.html en el deploy.");
+  }
+  res.sendFile(adminPath);
+});
+
+app.get(["/", /^\/index\.html$/i], (req, res) => {
+  if (!req.user) return res.redirect("/login");
+  if (req.user.role !== "user") return res.redirect(landingFor(req.user));
+  if (!fs.existsSync(indexPath)) {
+    return res
       .status(500)
       .send(
         "Falta index.html en el deploy. Revisa que el archivo esté commiteado en el repo (en public/ o en la raíz)."
       );
   }
+  res.sendFile(indexPath);
 });
 
-app.get("/api/status", (req, res) => {
-  const wallet = getWallet.get();
-  const boot = db.prepare("SELECT value FROM meta WHERE key = 'boot_at'").get();
+app.use(express.static(staticDir, { index: false }));
+
+// ---- auth api -----------------------------------------------------------
+app.post("/api/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email y contraseña son obligatorios." });
+  }
+  const user = getUserByEmail(email);
+  const ok = await bcrypt.compare(
+    String(password),
+    user ? user.password_hash : DUMMY_PASSWORD_HASH
+  );
+  if (!user || !ok) {
+    return res.status(401).json({ error: "Credenciales inválidas." });
+  }
+
+  db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(nowIso());
+  const sid = createSession(user.id);
+  res.cookie(SESSION_COOKIE, sid, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: req.secure,
+    path: "/",
+    // sin maxAge/expires a propósito: cookie de sesión de navegador.
+  });
+  res.json({ ok: true, role: user.role, redirect: landingFor(user) });
+});
+
+app.post("/api/logout", (req, res) => {
+  if (req.sessionId) destroySession(req.sessionId);
+  res.clearCookie(SESSION_COOKIE, { path: "/" });
+  res.json({ ok: true });
+});
+
+app.get("/api/me", requireAuthApi, (req, res) => {
+  res.json({ email: req.user.email, role: req.user.role });
+});
+
+// ---- admin api ------------------------------------------------------------
+app.get("/api/admin/users", requireRoleApi("admin"), (req, res) => {
+  const users = db
+    .prepare("SELECT id, email, role, created_at FROM users ORDER BY id ASC")
+    .all();
+  const enriched = users.map((u) => {
+    if (u.role !== "user") return u;
+    const wallet = getWallet(u.id);
+    const botCount = getMeta(u.id, "bot_count");
+    return {
+      ...u,
+      balance: wallet ? wallet.balance : null,
+      bot_count: botCount ? parseInt(botCount, 10) : null,
+    };
+  });
+  res.json(enriched);
+});
+
+app.post("/api/admin/users", requireRoleApi("admin"), (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || typeof email !== "string" || !/^\S+@\S+\.\S+$/.test(email.trim())) {
+    return res.status(400).json({ error: "Ingresa un email válido." });
+  }
+  if (!password || typeof password !== "string" || password.length < 8) {
+    return res
+      .status(400)
+      .json({ error: "La contraseña debe tener al menos 8 caracteres." });
+  }
+  if (getUserByEmail(email)) {
+    return res.status(409).json({ error: "Ya existe una cuenta con ese email." });
+  }
+
+  const passwordHash = bcrypt.hashSync(password, 12);
+  const userId = createUserRow(email, passwordHash, "user");
+  bootstrapNewUserAutomaton(userId);
+  ensureCurrentWeekPlanned(userId);
+
+  const created = getUserById(userId);
+  res.status(201).json({
+    id: created.id,
+    email: created.email,
+    role: created.role,
+    created_at: created.created_at,
+    balance: STARTING_BALANCE,
+    bot_count: INITIAL_BOT_COUNT,
+  });
+});
+
+// ---- automaton api (solo cuentas role='user', cada una ve SOLO lo suyo) ----
+app.get("/api/status", requireRoleApi("user"), (req, res) => {
+  const userId = req.user.id;
+  const wallet = getWallet(userId);
+  const bootAt = getMeta(userId, "boot_at");
 
   const startOfDay = new Date();
   startOfDay.setHours(0, 0, 0, 0);
-  const todays = eventsSince.all(startOfDay.toISOString());
+  const todays = taskEventsSinceStmt.all(userId, startOfDay.toISOString());
   const todayCredit = round2(
     todays.filter((e) => e.type === "credit").reduce((s, e) => s + e.amount, 0)
   );
@@ -684,10 +1075,8 @@ app.get("/api/status", (req, res) => {
 
   const weekStart = currentWeekStart(new Date());
   const weekStartKey = weekStart.toISOString();
-  const weekTargetRow = db
-    .prepare("SELECT value FROM meta WHERE key = ?")
-    .get(`week_target_${weekStartKey}`);
-  const weekEvents = eventsSince.all(weekStartKey);
+  const weekTarget = getMeta(userId, `week_target_${weekStartKey}`);
+  const weekEvents = taskEventsSinceStmt.all(userId, weekStartKey);
   const weekNet = round2(
     weekEvents.reduce(
       (s, e) => s + (e.type === "credit" ? e.amount : -e.amount),
@@ -698,7 +1087,7 @@ app.get("/api/status", (req, res) => {
   res.json({
     balance: wallet.balance,
     updated_at: wallet.updated_at,
-    boot_at: boot ? boot.value : null,
+    boot_at: bootAt,
     monthly_maintenance: MONTHLY_MAINTENANCE,
     daily_maintenance: round2(dailyMaintenance),
     runway_days: round2(daysOfRunwayLeft),
@@ -708,17 +1097,18 @@ app.get("/api/status", (req, res) => {
     today_net: round2(todayCredit - todayDebit),
     today_events: todays.length,
     week_start: weekStartKey,
-    week_target: weekTargetRow ? parseFloat(weekTargetRow.value) : null,
+    week_target: weekTarget ? parseFloat(weekTarget) : null,
     week_net_so_far: weekNet,
   });
 });
 
-app.get("/api/events", (req, res) => {
+app.get("/api/events", requireRoleApi("user"), (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
-  res.json(recentEvents.all(limit));
+  res.json(recentEventsStmt.all(req.user.id, limit));
 });
 
-app.post("/api/withdraw", express.json(), (req, res) => {
+app.post("/api/withdraw", requireRoleApi("user"), (req, res) => {
+  const userId = req.user.id;
   const { address, amount } = req.body || {};
 
   if (!address || typeof address !== "string") {
@@ -736,46 +1126,55 @@ app.post("/api/withdraw", express.json(), (req, res) => {
     return res.status(400).json({ error: "El monto debe ser mayor a 0." });
   }
 
-  const wallet = getWallet.get();
+  const wallet = getWallet(userId);
   if (amt > wallet.balance) {
     return res.status(400).json({ error: "Saldo insuficiente para ese retiro." });
   }
 
   const newBalance = round2(wallet.balance - amt);
-  const now = new Date().toISOString();
+  const now = nowIso();
   const shortAddr = `${trimmedAddress.slice(0, 4)}…${trimmedAddress.slice(-4)}`;
 
-  updateWallet.run(newBalance, now);
-  insertEvent.run(now, "debit", amt, `Retiro a billetera — ${shortAddr}`, newBalance);
+  updateWallet(userId, newBalance, now);
+  insertEvent(
+    userId,
+    now,
+    "debit",
+    amt,
+    `Retiro a billetera — ${shortAddr}`,
+    newBalance,
+    "withdrawal"
+  );
   db.prepare(
-    "INSERT INTO withdrawals (ts, address, amount, balance_after) VALUES (?,?,?,?)"
-  ).run(now, trimmedAddress, amt, newBalance);
+    "INSERT INTO withdrawals (user_id, ts, address, amount, balance_after, kind) VALUES (?,?,?,?,?,'manual')"
+  ).run(userId, now, trimmedAddress, amt, newBalance);
 
   res.json({ ok: true, balance: newBalance, amount: amt, address: trimmedAddress });
 });
 
-app.get("/api/withdrawals", (req, res) => {
+app.get("/api/withdrawals", requireRoleApi("user"), (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
   res.json(
     db
-      .prepare("SELECT * FROM withdrawals ORDER BY id DESC LIMIT ?")
-      .all(limit)
+      .prepare(
+        "SELECT * FROM withdrawals WHERE user_id = ? ORDER BY id DESC LIMIT ?"
+      )
+      .all(req.user.id, limit)
   );
 });
 
-app.get("/api/bots", (req, res) => {
-  const countRow = db
-    .prepare("SELECT value FROM meta WHERE key = 'bot_count'")
-    .get();
-  const progressRow = db
-    .prepare("SELECT value FROM meta WHERE key = 'bot_progress_net'")
-    .get();
+app.get("/api/bots", requireRoleApi("user"), (req, res) => {
+  const userId = req.user.id;
+  const countRaw = getMeta(userId, "bot_count");
+  const progressRaw = getMeta(userId, "bot_progress_net");
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 200);
   res.json({
-    count: countRow ? parseInt(countRow.value, 10) : INITIAL_BOT_COUNT,
-    progress_to_next: progressRow ? parseFloat(progressRow.value) : 0,
+    count: countRaw ? parseInt(countRaw, 10) : INITIAL_BOT_COUNT,
+    progress_to_next: progressRaw ? parseFloat(progressRaw) : 0,
     milestone_usd: BOT_MILESTONE_USD,
-    bots: db.prepare("SELECT * FROM bots ORDER BY id DESC LIMIT ?").all(limit),
+    bots: db
+      .prepare("SELECT * FROM bots WHERE user_id = ? ORDER BY id DESC LIMIT ?")
+      .all(userId, limit),
   });
 });
 
@@ -783,4 +1182,3 @@ app.listen(PORT, () => {
   console.log(`Automaton simulation running on http://localhost:${PORT}`);
   console.log(`DB persisted at ${DB_PATH}`);
 });
-
