@@ -154,87 +154,6 @@ db.exec(`
   );
 `);
 
-// ---- migración de esquema: single-tenant -> multi-tenant --------------------
-// Si las tablas de datos (wallet/events/...) todavía tienen la forma vieja
-// (sin columna user_id), significa que estamos corriendo por primera vez
-// contra la base de datos de producción anterior a este cambio. Las
-// renombramos a "*_legacy" (nunca se borran — quedan como respaldo) y dejamos
-// los nombres originales libres para las tablas nuevas con forma multi-usuario.
-const legacyWalletDetected =
-  tableExists("wallet") && !hasColumn("wallet", "user_id");
-
-if (legacyWalletDetected) {
-  const legacyTables = [
-    "wallet",
-    "events",
-    "planned_events",
-    "withdrawals",
-    "bots",
-    "meta",
-  ];
-  db.transaction(() => {
-    for (const t of legacyTables) {
-      if (tableExists(t)) db.exec(`ALTER TABLE ${t} RENAME TO ${t}_legacy`);
-    }
-  })();
-  console.log(
-    "🗄️  Esquema anterior (single-tenant) detectado — tablas renombradas a *_legacy (no se borran, quedan de respaldo)."
-  );
-}
-
-// ---- tablas multi-tenant (se crean limpias si no existían, o si se acaban
-// de liberar los nombres arriba) ----------------------------------------------
-db.exec(`
-  CREATE TABLE IF NOT EXISTS wallet (
-    user_id INTEGER PRIMARY KEY REFERENCES users(id),
-    balance REAL NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    ts TEXT NOT NULL,
-    type TEXT NOT NULL CHECK (type IN ('credit','debit')),
-    amount REAL NOT NULL,
-    label TEXT NOT NULL,
-    balance_after REAL NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'task' CHECK (kind IN ('task','withdrawal'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_events_user ON events (user_id, id);
-  CREATE TABLE IF NOT EXISTS planned_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    week_start TEXT NOT NULL,
-    scheduled_ts TEXT NOT NULL,
-    type TEXT NOT NULL CHECK (type IN ('credit','debit')),
-    amount REAL NOT NULL,
-    label TEXT NOT NULL,
-    fired INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE INDEX IF NOT EXISTS idx_planned_due ON planned_events (user_id, fired, scheduled_ts);
-  CREATE TABLE IF NOT EXISTS withdrawals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    ts TEXT NOT NULL,
-    address TEXT NOT NULL,
-    amount REAL NOT NULL,
-    balance_after REAL NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'manual' CHECK (kind IN ('manual','auto_bot'))
-  );
-  CREATE TABLE IF NOT EXISTS bots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    label TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS meta (
-    user_id INTEGER NOT NULL REFERENCES users(id),
-    key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    PRIMARY KEY (user_id, key)
-  );
-`);
-
 // ---- helpers genéricos --------------------------------------------------
 function round2(n) {
   return Math.round(n * 100) / 100;
@@ -310,13 +229,101 @@ function bootstrapNewUserAutomaton(userId) {
   setMeta(userId, "bot_progress_net", "0");
 }
 
-// ---- seed de cuentas + migración de datos existentes (una sola vez) --------
-// Igual que los ajustes de una sola vez que ya existían en este archivo: se
-// guarda una bandera en system_meta para que esto nunca se repita en próximos
-// reinicios/deploys.
+// ---- migración de esquema (single-tenant -> multi-tenant) + seed de cuentas
+// -----------------------------------------------------------------------------
+// Si las tablas de datos (wallet/events/...) todavía tienen la forma vieja
+// (sin columna user_id), significa que estamos corriendo por primera vez
+// contra la base de datos de producción anterior a este cambio.
+//
+// TODO este bloque — detectar, renombrar las tablas viejas a "*_legacy"
+// (nunca se borran, quedan de respaldo), crear las tablas nuevas, crear las
+// cuentas admin/Jorge y copiar los datos — corre dentro de UNA sola
+// transacción. Así, si el proceso se cae a la mitad (ej. el contenedor se
+// reinicia justo en ese instante), en el próximo arranque no queda nada a
+// medio migrar: o se aplicó todo, o no se aplicó nada y se reintenta desde
+// cero de forma segura.
+const legacyWalletDetected =
+  tableExists("wallet") && !hasColumn("wallet", "user_id");
 const SEED_KEY = "v2_multiuser_seed_done";
-if (!getSystemMeta(SEED_KEY)) {
-  db.transaction(() => {
+
+db.transaction(() => {
+  if (legacyWalletDetected) {
+    const legacyTables = [
+      "wallet",
+      "events",
+      "planned_events",
+      "withdrawals",
+      "bots",
+      "meta",
+    ];
+    for (const t of legacyTables) {
+      if (tableExists(t)) db.exec(`ALTER TABLE ${t} RENAME TO ${t}_legacy`);
+    }
+    console.log(
+      "🗄️  Esquema anterior (single-tenant) detectado — tablas renombradas a *_legacy (no se borran, quedan de respaldo)."
+    );
+  }
+
+  // Tablas multi-tenant: se crean limpias si no existían, o si se acaban de
+  // liberar los nombres arriba. Esto corre en CADA arranque (idempotente),
+  // no solo la primera vez.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS wallet (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      balance REAL NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      ts TEXT NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('credit','debit')),
+      amount REAL NOT NULL,
+      label TEXT NOT NULL,
+      balance_after REAL NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'task' CHECK (kind IN ('task','withdrawal'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_user ON events (user_id, id);
+    CREATE TABLE IF NOT EXISTS planned_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      week_start TEXT NOT NULL,
+      scheduled_ts TEXT NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('credit','debit')),
+      amount REAL NOT NULL,
+      label TEXT NOT NULL,
+      fired INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_planned_due ON planned_events (user_id, fired, scheduled_ts);
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      ts TEXT NOT NULL,
+      address TEXT NOT NULL,
+      amount REAL NOT NULL,
+      balance_after REAL NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'manual' CHECK (kind IN ('manual','auto_bot'))
+    );
+    CREATE TABLE IF NOT EXISTS bots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      label TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS meta (
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      PRIMARY KEY (user_id, key)
+    );
+  `);
+
+  // El seed de cuentas + migración de datos sí debe correr una sola vez
+  // (igual que los ajustes de una sola vez que ya existían en este archivo,
+  // guardado como bandera en system_meta).
+  if (getSystemMeta(SEED_KEY)) return;
+
+  {
     let admin = getUserByEmail(ADMIN_EMAIL);
     if (!admin) {
       const id = createUserRow(
@@ -441,8 +448,8 @@ if (!getSystemMeta(SEED_KEY)) {
     }
 
     setSystemMeta(SEED_KEY, nowIso());
-  })();
-}
+  }
+})();
 
 // ---- Solana address validation ----------------------------------------------
 // Solana public keys are base58-encoded 32-byte values. A regex alone only
@@ -863,6 +870,7 @@ const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString("hex
 // ---- http api -----------------------------------------------------------
 const app = express();
 app.set("trust proxy", 1); // Railway termina TLS y reenvía X-Forwarded-Proto
+app.disable("x-powered-by");
 app.use(express.json());
 app.use(cookieParser());
 
@@ -971,29 +979,37 @@ app.use(express.static(staticDir, { index: false }));
 
 // ---- auth api -----------------------------------------------------------
 app.post("/api/login", async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) {
-    return res.status(400).json({ error: "Email y contraseña son obligatorios." });
-  }
-  const user = getUserByEmail(email);
-  const ok = await bcrypt.compare(
-    String(password),
-    user ? user.password_hash : DUMMY_PASSWORD_HASH
-  );
-  if (!user || !ok) {
-    return res.status(401).json({ error: "Credenciales inválidas." });
-  }
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email y contraseña son obligatorios." });
+    }
+    const user = getUserByEmail(email);
+    const ok = await bcrypt.compare(
+      String(password),
+      user ? user.password_hash : DUMMY_PASSWORD_HASH
+    );
+    if (!user || !ok) {
+      return res.status(401).json({ error: "Credenciales inválidas." });
+    }
 
-  db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(nowIso());
-  const sid = createSession(user.id);
-  res.cookie(SESSION_COOKIE, sid, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: req.secure,
-    path: "/",
-    // sin maxAge/expires a propósito: cookie de sesión de navegador.
-  });
-  res.json({ ok: true, role: user.role, redirect: landingFor(user) });
+    db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(nowIso());
+    const sid = createSession(user.id);
+    res.cookie(SESSION_COOKIE, sid, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: req.secure,
+      path: "/",
+      // sin maxAge/expires a propósito: cookie de sesión de navegador.
+    });
+    res.json({ ok: true, role: user.role, redirect: landingFor(user) });
+  } catch (err) {
+    // bcrypt.compare es async — si llegara a rechazar, un throw sin capturar
+    // aquí se perdería como unhandled rejection y podría tumbar el proceso
+    // para TODOS los usuarios (multi-tenant). Mejor responder 500 y loguear.
+    console.error("Error en /api/login:", err);
+    res.status(500).json({ error: "Error interno del servidor." });
+  }
 });
 
 app.post("/api/logout", (req, res) => {
@@ -1026,7 +1042,14 @@ app.get("/api/admin/users", requireRoleApi("admin"), (req, res) => {
 
 app.post("/api/admin/users", requireRoleApi("admin"), (req, res) => {
   const { email, password } = req.body || {};
-  if (!email || typeof email !== "string" || !/^\S+@\S+\.\S+$/.test(email.trim())) {
+  // Charset restringido a propósito (nada de <>"'&\` ni espacios): el admin
+  // panel muestra este email luego en la lista de cuentas, y así queda
+  // excluida cualquier posibilidad de inyectar HTML/JS vía el email.
+  if (
+    !email ||
+    typeof email !== "string" ||
+    !/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(email.trim())
+  ) {
     return res.status(400).json({ error: "Ingresa un email válido." });
   }
   if (!password || typeof password !== "string" || password.length < 8) {
@@ -1038,9 +1061,24 @@ app.post("/api/admin/users", requireRoleApi("admin"), (req, res) => {
     return res.status(409).json({ error: "Ya existe una cuenta con ese email." });
   }
 
-  const passwordHash = bcrypt.hashSync(password, 12);
-  const userId = createUserRow(email, passwordHash, "user");
-  bootstrapNewUserAutomaton(userId);
+  let userId;
+  try {
+    const passwordHash = bcrypt.hashSync(password, 12);
+    // Atómico: si bootstrapNewUserAutomaton fallara a mitad de camino, no
+    // debe quedar un usuario a medias sin wallet/bots.
+    userId = db.transaction(() => {
+      const id = createUserRow(email, passwordHash, "user");
+      bootstrapNewUserAutomaton(id);
+      return id;
+    })();
+  } catch (err) {
+    if (String(err.code).startsWith("SQLITE_CONSTRAINT")) {
+      // Otra petición creó el mismo email en el instante entre el check de
+      // arriba y este insert.
+      return res.status(409).json({ error: "Ya existe una cuenta con ese email." });
+    }
+    throw err;
+  }
   ensureCurrentWeekPlanned(userId);
 
   const created = getUserById(userId);
@@ -1175,6 +1213,19 @@ app.get("/api/bots", requireRoleApi("user"), (req, res) => {
     bots: db
       .prepare("SELECT * FROM bots WHERE user_id = ? ORDER BY id DESC LIMIT ?")
       .all(userId, limit),
+  });
+});
+
+// Manejador de errores final: cualquier excepción no capturada en una ruta
+// (sync o pasada vía next(err)) termina aquí en vez de dejar que el
+// manejador por defecto de Express filtre el stack trace al cliente cuando
+// NODE_ENV no está en "production".
+app.use((err, req, res, next) => {
+  console.error("Error no manejado:", err);
+  if (res.headersSent) return next(err);
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({
+    error: status < 500 ? "Solicitud inválida." : "Error interno del servidor.",
   });
 });
 

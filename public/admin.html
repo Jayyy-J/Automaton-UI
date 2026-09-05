@@ -172,6 +172,11 @@
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => n === null || n === undefined ? '—' : ((n < 0 ? "-$" : "$") + Math.abs(n).toFixed(2));
 const fmtDate = (iso) => new Date(iso).toLocaleString('es-CO');
+function escapeHtml(str){
+  const div = document.createElement('div');
+  div.textContent = String(str);
+  return div.innerHTML;
+}
 
 async function loadUsers(){
   const feed = $('usersFeed');
@@ -199,8 +204,8 @@ async function loadUsers(){
       const row = document.createElement('div');
       row.className = 'u-row';
       row.innerHTML = `
-        <div class="email">${u.email}</div>
-        <div><span class="u-role ${u.role}">${u.role === 'admin' ? 'ADMIN' : 'USER'}</span></div>
+        <div class="email">${escapeHtml(u.email)}</div>
+        <div><span class="u-role ${u.role === 'admin' ? 'admin' : 'user'}">${u.role === 'admin' ? 'ADMIN' : 'USER'}</span></div>
         <div class="bal">${u.role === 'user' ? fmt(u.balance) : '—'}</div>
         <div class="bots">${u.role === 'user' && u.bot_count !== null ? u.bot_count : '—'}</div>
         <div class="t">${fmtDate(u.created_at)}</div>
