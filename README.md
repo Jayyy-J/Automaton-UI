@@ -31,6 +31,23 @@ usa el formulario en `/admin`. Es la única forma de dar de alta un usuario
 nuevo — no existe una ruta de registro público ni se necesita tocar Railway
 ni la base de datos a mano.
 
+### Variables de entorno obligatorias en el primer deploy
+
+Las contraseñas de las dos cuentas iniciales (admin y Jorge) **no están en el
+código** — el server las lee una sola vez, en el momento de crear cada
+cuenta, desde estas variables de entorno en Railway:
+
+- `SEED_ADMIN_PASSWORD` → contraseña de `jota71663@gmail.com`
+- `SEED_JORGE_PASSWORD` → contraseña de `jryesid@gmail.com`
+
+Si falta alguna y esa cuenta todavía no existe, el server **no arranca** (se
+detiene con un mensaje claro en los logs indicando cuál falta) en vez de
+crear la cuenta con una contraseña por defecto o dejarla a medias. Una vez
+creadas ambas cuentas (ya quedó guardado el hash bcrypt en la base de
+datos), estas variables ya no se vuelven a leer — puedes borrarlas de
+Railway después del primer deploy exitoso si quieres, aunque dejarlas no
+tiene ningún costo de seguridad adicional (ya no se usan para nada).
+
 ## Migración de datos existentes
 
 La primera vez que este código corre contra una base de datos que todavía
@@ -40,6 +57,13 @@ quedan de respaldo) y copia todo ese estado — saldo, historial de eventos,
 retiros, flota de bots y planificación pendiente — a la cuenta
 `jryesid@gmail.com`. Esto ocurre una sola vez (queda una bandera guardada en
 la tabla `system_meta`) y nunca se repite en reinicios posteriores.
+
+Todo este proceso (detectar, renombrar, crear las cuentas y copiar los
+datos) corre dentro de una sola transacción: si `SEED_ADMIN_PASSWORD` o
+`SEED_JORGE_PASSWORD` faltan, o el proceso se interrumpe a la mitad por
+cualquier motivo, no se guarda nada — ni el renombrado de tablas, ni cuentas
+a medias — y se reintenta desde cero, de forma segura, en el próximo
+arranque.
 
 ## Regla semanal
 

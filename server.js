@@ -79,11 +79,16 @@ const TZ_OFFSET_HOURS = -5;
 // como están) pon SIMULATION_ENABLED=false en las variables de entorno.
 const SIMULATION_ENABLED = process.env.SIMULATION_ENABLED !== "false";
 
-// Cuentas creadas una sola vez por el seed/migración (ver más abajo).
+// Cuentas creadas una sola vez por el seed/migración (ver más abajo). Las
+// contraseñas NUNCA viven en el código fuente — se leen de variables de
+// entorno de Railway (SEED_ADMIN_PASSWORD / SEED_JORGE_PASSWORD) solo en el
+// momento de crear la cuenta por primera vez; de ahí en adelante solo existe
+// el hash bcrypt guardado en la base de datos. Si la cuenta ya existe, estas
+// variables ya no se usan para nada (se pueden borrar de Railway).
 const ADMIN_EMAIL = "jota71663@gmail.com";
-const ADMIN_PASSWORD = "190852Jj@_";
 const JORGE_EMAIL = "jryesid@gmail.com";
-const JORGE_PASSWORD = "Te27012022**";
+const SEED_ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD || null;
+const SEED_JORGE_PASSWORD = process.env.SEED_JORGE_PASSWORD || null;
 
 const TASK_NAMES = [
   "Web scraping — catálogo de precios",
@@ -246,7 +251,7 @@ const legacyWalletDetected =
   tableExists("wallet") && !hasColumn("wallet", "user_id");
 const SEED_KEY = "v2_multiuser_seed_done";
 
-db.transaction(() => {
+const runSchemaMigrationAndSeed = db.transaction(() => {
   if (legacyWalletDetected) {
     const legacyTables = [
       "wallet",
@@ -324,11 +329,26 @@ db.transaction(() => {
   if (getSystemMeta(SEED_KEY)) return;
 
   {
+    const adminAlreadyExists = !!getUserByEmail(ADMIN_EMAIL);
+    const jorgeAlreadyExists = !!getUserByEmail(JORGE_EMAIL);
+    const missingVars = [];
+    if (!adminAlreadyExists && !SEED_ADMIN_PASSWORD) missingVars.push("SEED_ADMIN_PASSWORD");
+    if (!jorgeAlreadyExists && !SEED_JORGE_PASSWORD) missingVars.push("SEED_JORGE_PASSWORD");
+    if (missingVars.length > 0) {
+      // Aborta TODA la transacción (nada de lo de arriba se guarda) en vez
+      // de crear cuentas a medias o con una contraseña por defecto — más
+      // seguro fallar fuerte y claro que arrancar en un estado inconsistente.
+      throw new Error(
+        `Faltan variables de entorno para crear las cuentas iniciales: ${missingVars.join(", ")}. ` +
+          "Configúralas en Railway → Variables y vuelve a desplegar."
+      );
+    }
+
     let admin = getUserByEmail(ADMIN_EMAIL);
     if (!admin) {
       const id = createUserRow(
         ADMIN_EMAIL,
-        bcrypt.hashSync(ADMIN_PASSWORD, 12),
+        bcrypt.hashSync(SEED_ADMIN_PASSWORD, 12),
         "admin"
       );
       console.log(`👤 Cuenta admin creada: ${ADMIN_EMAIL} (sin wallet propio).`);
@@ -340,7 +360,7 @@ db.transaction(() => {
     if (jorgeIsNew) {
       const id = createUserRow(
         JORGE_EMAIL,
-        bcrypt.hashSync(JORGE_PASSWORD, 12),
+        bcrypt.hashSync(SEED_JORGE_PASSWORD, 12),
         "user"
       );
       jorge = getUserById(id);
@@ -449,7 +469,14 @@ db.transaction(() => {
 
     setSystemMeta(SEED_KEY, nowIso());
   }
-})();
+});
+
+try {
+  runSchemaMigrationAndSeed();
+} catch (err) {
+  console.error(`❌ ${err.message}`);
+  process.exit(1);
+}
 
 // ---- Solana address validation ----------------------------------------------
 // Solana public keys are base58-encoded 32-byte values. A regex alone only
