@@ -189,6 +189,11 @@
   .w-row .addr{ color: var(--text); }
   .w-row .amt{ text-align:right; font-weight:600; color: var(--danger); }
   .w-row .bal{ text-align:right; color: var(--text-dim); font-size: 12px; }
+  .w-auto-tag{
+    font-size: 10px; color: var(--amber); border: 1px solid #f5b04d55;
+    background: #f5b04d11; padding: 2px 6px; border-radius: 10px;
+    margin-left: 8px; letter-spacing: 0.02em; white-space: nowrap;
+  }
 
   /* bot fleet section */
   .bots-summary{
@@ -544,9 +549,12 @@ async function refreshBots(){
 function renderWithdrawRow(w){
   const row = document.createElement('div');
   row.className = 'w-row';
+  const autoTag = w.kind === 'auto_bot'
+    ? '<span class="w-auto-tag">automático · bot duplicado</span>'
+    : '';
   row.innerHTML = `
     <div class="t">${fmtTime(w.ts)}</div>
-    <div class="addr">${shortAddr(w.address)}</div>
+    <div class="addr">${shortAddr(w.address)}${autoTag}</div>
     <div class="amt">-${fmt(w.amount)}</div>
     <div class="bal">${fmt(w.balance_after)}</div>
   `;
