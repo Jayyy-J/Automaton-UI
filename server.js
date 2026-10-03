@@ -52,8 +52,14 @@ const EVENT_MAX_GAP_MS = 3 * 60 * 60 * 1000; // 3 h
 // Weekly net-profit target range. Each week (Sat–Fri, Colombia time) gets a
 // random target in this range, and the week's events are sized so the
 // cumulative net (credits - debits) lands exactly on that target by Friday.
-const WEEKLY_PROFIT_MIN = 35;
-const WEEKLY_PROFIT_MAX = 195;
+// Con el hito de bot a $150, $750-$975/semana da entre 5 y 6 bots nuevos por
+// semana "de forma natural" (en promedio — el feasibility-guarantee de más
+// abajo ya soporta este rango sin necesitar más eventos/semana: incluso en
+// la semana más dispersa posible, con TODOS los slots convertidos a crédito,
+// el tope por evento ($25) multiplicado por la cantidad mínima de slots de
+// una semana sigue superando el objetivo máximo).
+const WEEKLY_PROFIT_MIN = 750;
+const WEEKLY_PROFIT_MAX = 975;
 
 const CREDIT_MIN = 0.5;
 const CREDIT_MAX = 25;
@@ -65,6 +71,17 @@ const CREDIT_PROBABILITY = 0.55; // share of weekly slots typed as "credit"
 // de TAREAS (créditos - débitos; retiros no cuentan) avanza BOT_MILESTONE_USD,
 // se agrega un bot nuevo a la flota de ESE usuario y el contador se reinicia.
 const BOT_MILESTONE_USD = 150;
+
+// Cobertura diaria garantizada: un barrido periódico revisa que CADA bot de
+// CADA usuario tenga al menos 1 evento hoy (día calendario, hora Colombia);
+// si no, le genera uno de relleno con un monto mínimo. Usa las mismas listas
+// de nombres de tarea/razón de débito que los eventos normales — para quien
+// lo vea, es indistinguible de actividad real (ver nota en
+// fillMissingDailyActivity). No cuenta para la regla semanal ni el progreso
+// de bots (ver columna counts_toward_targets en events).
+const FILLER_MIN = 0.01;
+const FILLER_MAX = 0.05;
+const DAILY_COVERAGE_SWEEP_MS = 60 * 60 * 1000; // cada hora
 
 // Cada bot nuevo dispara un retiro automático de este monto (si el saldo
 // alcanza; si no, se retira lo que haya disponible) a esta dirección fija.
@@ -286,7 +303,9 @@ const runSchemaMigrationAndSeed = db.transaction(() => {
       amount REAL NOT NULL,
       label TEXT NOT NULL,
       balance_after REAL NOT NULL,
-      kind TEXT NOT NULL DEFAULT 'task' CHECK (kind IN ('task','withdrawal'))
+      kind TEXT NOT NULL DEFAULT 'task' CHECK (kind IN ('task','withdrawal')),
+      bot_id INTEGER REFERENCES bots(id),
+      counts_toward_targets INTEGER NOT NULL DEFAULT 1
     );
     CREATE INDEX IF NOT EXISTS idx_events_user ON events (user_id, id);
     CREATE TABLE IF NOT EXISTS planned_events (
@@ -322,6 +341,25 @@ const runSchemaMigrationAndSeed = db.transaction(() => {
       PRIMARY KEY (user_id, key)
     );
   `);
+
+  // events.bot_id / events.counts_toward_targets son columnas nuevas. Para
+  // una base de datos que ya tenía la tabla `events` multi-tenant de una
+  // versión anterior de este archivo (sin estas columnas), se agregan con
+  // ALTER TABLE ADD COLUMN — nunca se recrea ni se borra la tabla, así que
+  // todo el historial existente queda intacto (counts_toward_targets queda
+  // en 1 por defecto en las filas viejas, que es justo lo correcto: ya
+  // contaban para la regla semanal / progreso de bots cuando se generaron).
+  if (!hasColumn("events", "bot_id")) {
+    db.exec("ALTER TABLE events ADD COLUMN bot_id INTEGER REFERENCES bots(id)");
+    console.log("🗄️  Columna events.bot_id agregada.");
+  }
+  if (!hasColumn("events", "counts_toward_targets")) {
+    db.exec(
+      "ALTER TABLE events ADD COLUMN counts_toward_targets INTEGER NOT NULL DEFAULT 1"
+    );
+    console.log("🗄️  Columna events.counts_toward_targets agregada.");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_events_bot ON events (bot_id, id);");
 
   // El seed de cuentas + migración de datos sí debe correr una sola vez
   // (igual que los ajustes de una sola vez que ya existían en este archivo,
@@ -478,6 +516,51 @@ try {
   process.exit(1);
 }
 
+// ---- backfill: atribuir bot_id a eventos 'task' que existían antes de que
+// esta columna existiera -----------------------------------------------------
+// Se asigna al azar entre los bots de ESE usuario que ya existían en el
+// momento del evento (bot.created_at <= evento.ts) — no un bot cualquiera,
+// sino uno que de verdad pudo haber generado esa actividad en esa fecha. Si
+// ninguno califica (el evento es más viejo que todos sus bots, caso límite
+// poco probable), se usa cualquier bot de ese usuario en vez de dejarlo sin
+// asignar. Los eventos 'withdrawal' nunca reciben bot_id (los retiros no los
+// genera un bot). Corre una sola vez, guardado en system_meta.
+const BOT_BACKFILL_KEY = "events_bot_id_backfill_done";
+if (!getSystemMeta(BOT_BACKFILL_KEY)) {
+  const runBotIdBackfill = db.transaction(() => {
+    const usersList = db.prepare("SELECT id FROM users WHERE role = 'user'").all();
+    const updateBotId = db.prepare("UPDATE events SET bot_id = ? WHERE id = ?");
+    let totalAssigned = 0;
+    for (const u of usersList) {
+      const userBots = db
+        .prepare("SELECT id, created_at FROM bots WHERE user_id = ? ORDER BY id ASC")
+        .all(u.id);
+      if (userBots.length === 0) continue;
+
+      const missing = db
+        .prepare(
+          "SELECT id, ts FROM events WHERE user_id = ? AND kind = 'task' AND bot_id IS NULL"
+        )
+        .all(u.id);
+      for (const ev of missing) {
+        const eligible = userBots.filter((b) => b.created_at <= ev.ts);
+        const pool = eligible.length > 0 ? eligible : userBots;
+        const chosen = pool[Math.floor(Math.random() * pool.length)];
+        updateBotId.run(chosen.id, ev.id);
+        totalAssigned++;
+      }
+    }
+    setSystemMeta(BOT_BACKFILL_KEY, nowIso());
+    return totalAssigned;
+  });
+  const assigned = runBotIdBackfill();
+  if (assigned > 0) {
+    console.log(
+      `🤖 Backfill: ${assigned} eventos históricos recibieron un bot_id (asignado al azar entre los bots que ya existían en su fecha).`
+    );
+  }
+}
+
 // ---- Solana address validation ----------------------------------------------
 // Solana public keys are base58-encoded 32-byte values. A regex alone only
 // checks the character set (excludes 0/O/I/l, 32-44 chars) — decoding to
@@ -540,6 +623,18 @@ function currentWeekStart(now = new Date()) {
 
 function weekEndFromStart(weekStartUTC) {
   return new Date(weekStartUTC.getTime() + 7 * 24 * 3600 * 1000 - 1);
+}
+
+// Real UTC Date para las 00:00:00 hora Colombia del día calendario que
+// contiene `now` — mismo patrón que currentWeekStart, pero para "hoy" en vez
+// de "esta semana". Usado tanto para las estadísticas de "hoy" en
+// /api/status como para el barrido de cobertura diaria de bots.
+function colombiaDayStart(now = new Date()) {
+  const col = colombiaShifted(now);
+  const colMidnight = new Date(
+    Date.UTC(col.getUTCFullYear(), col.getUTCMonth(), col.getUTCDate())
+  );
+  return new Date(colMidnight.getTime() - TZ_OFFSET_HOURS * 3600 * 1000);
 }
 
 // Splits `sum` into `n` positive parts, each within [lo, hi], summing exactly
@@ -658,6 +753,31 @@ function generateWeeklyPlanIfMissing(userId, weekStartDate, planFromDate) {
     creditIdx.push(debitIdx);
   }
 
+  // Segunda guarantee, necesaria desde que el objetivo subió a $750-$975:
+  // incluso con TODOS los slots convertidos a crédito, una semana (o resto
+  // de semana) con muy pocos slots de por sí — por ejemplo una cuenta
+  // creada a pocas horas de que cierre, donde el azar generó 1-2 eventos en
+  // total — puede seguir sin tener suficiente capacidad (n * CREDIT_MAX
+  // todavía por debajo del objetivo). En ese caso se agregan slots extra de
+  // puro crédito, repartidos parejo en lo que queda de la ventana, hasta que
+  // sea alcanzable. Se insertan sin el espaciado normal de 15min-3h porque
+  // existir en absoluto (y sumar lo que falta) importa más que el cadenciado
+  // natural en este caso límite poco frecuente.
+  while (creditIdx.length * CREDIT_MAX < round2(target + sumDebits)) {
+    const neededCredits = Math.ceil(round2(target + sumDebits) / CREDIT_MAX);
+    const extraNeeded = Math.max(1, neededCredits - creditIdx.length);
+    const spanMs = Math.max(1, weekEndDate.getTime() - planStart.getTime());
+    for (let k = 0; k < extraNeeded; k++) {
+      const extraTs =
+        planStart.getTime() +
+        Math.floor((spanMs * (k + 1)) / (extraNeeded + 1));
+      slots.push(extraTs);
+      types.push("credit");
+      debitAmounts.push(null);
+      creditIdx.push(slots.length - 1);
+    }
+  }
+
   const creditTargetSum = round2(target + sumDebits);
   const creditAmounts = partitionBounded(
     creditTargetSum,
@@ -727,13 +847,36 @@ const updateWalletStmt = db.prepare(
   "UPDATE wallet SET balance = ?, updated_at = ? WHERE user_id = ?"
 );
 const insertEventStmt = db.prepare(
-  "INSERT INTO events (user_id, ts, type, amount, label, balance_after, kind) VALUES (?,?,?,?,?,?,?)"
+  `INSERT INTO events (user_id, ts, type, amount, label, balance_after, kind, bot_id, counts_toward_targets)
+   VALUES (?,?,?,?,?,?,?,?,?)`
 );
+// Solo las columnas que el frontend realmente necesita — nunca kind ni
+// counts_toward_targets, para que un evento de relleno (Cambio 2) sea
+// indistinguible de uno real también a nivel de red/JSON, no solo visual.
 const recentEventsStmt = db.prepare(
-  "SELECT * FROM events WHERE user_id = ? ORDER BY id DESC LIMIT ?"
+  `SELECT events.id, events.ts, events.type, events.amount, events.label, events.balance_after,
+          bots.label AS bot_label
+   FROM events LEFT JOIN bots ON bots.id = events.bot_id
+   WHERE events.user_id = ? ORDER BY events.id DESC LIMIT ?`
 );
+// "Hoy" (today_credit/debit/net/events en /api/status): incluye TODO evento
+// tipo 'task', relleno incluido — si el relleno quedara fuera de aquí pero
+// sí apareciera en el feed en vivo, el usuario vería más eventos en el feed
+// que "tareas procesadas hoy", justo el tipo de inconsistencia que delataría
+// que algo no es genuino. Por eso aquí NO se filtra por counts_toward_targets.
 const taskEventsSinceStmt = db.prepare(
   "SELECT * FROM events WHERE user_id = ? AND kind = 'task' AND ts >= ? ORDER BY id ASC"
+);
+// Objetivo semanal / progreso de bots: estos sí deben excluir el relleno,
+// para que la semana siga cerrando exacto en el rango calculado de antemano
+// y el contador de progreso no avance por actividad que no es parte de la
+// planificación real.
+const countingTaskEventsSinceStmt = db.prepare(
+  "SELECT * FROM events WHERE user_id = ? AND kind = 'task' AND counts_toward_targets = 1 AND ts >= ? ORDER BY id ASC"
+);
+const botEventsStmt = db.prepare(
+  `SELECT id, ts, type, amount, label, balance_after
+   FROM events WHERE user_id = ? AND bot_id = ? ORDER BY id DESC LIMIT ?`
 );
 
 function getWallet(userId) {
@@ -742,8 +885,38 @@ function getWallet(userId) {
 function updateWallet(userId, balance, ts) {
   updateWalletStmt.run(balance, ts, userId);
 }
-function insertEvent(userId, ts, type, amount, label, balanceAfter, kind) {
-  insertEventStmt.run(userId, ts, type, amount, label, balanceAfter, kind);
+function insertEvent(
+  userId,
+  ts,
+  type,
+  amount,
+  label,
+  balanceAfter,
+  kind,
+  botId = null,
+  countsTowardTargets = true
+) {
+  insertEventStmt.run(
+    userId,
+    ts,
+    type,
+    amount,
+    label,
+    balanceAfter,
+    kind,
+    botId,
+    countsTowardTargets ? 1 : 0
+  );
+}
+
+// Elige un bot al azar entre los que YA existen para este usuario en este
+// momento — nunca uno que se vaya a crear después (ORDER BY RANDOM() sobre
+// la lista actual de bots.id). null si el usuario todavía no tiene ninguno.
+function pickRandomBotId(userId) {
+  const row = db
+    .prepare("SELECT id FROM bots WHERE user_id = ? ORDER BY RANDOM() LIMIT 1")
+    .get(userId);
+  return row ? row.id : null;
 }
 
 // Retiro automático de $50 a la dirección fija, disparado cada vez que se
@@ -809,15 +982,36 @@ function updateBotProgress(userId, netDelta) {
   setMeta(userId, "bot_progress_net", String(progress));
 }
 
-function recordEvent(userId, type, amount, label) {
+// `botId`: a qué bot atribuir el evento. Por defecto (undefined) se elige al
+// azar entre los bots que el usuario tiene EN ESTE MOMENTO — nunca uno que
+// se cree después. El barrido de cobertura diaria (Cambio 2) pasa un botId
+// explícito (el bot específico al que le falta actividad hoy) en vez de
+// dejarlo al azar.
+// `countsTowardTargets`: false para los eventos de relleno del Cambio 2 —
+// no avanzan el contador de progreso de bots ni la regla de ganancia
+// semanal, igual que ya hacen los retiros.
+function recordEvent(userId, type, amount, label, { botId, countsTowardTargets = true } = {}) {
   const wallet = getWallet(userId);
   const newBalance = round2(
     type === "credit" ? wallet.balance + amount : wallet.balance - amount
   );
   const now = nowIso();
+  const resolvedBotId = botId !== undefined ? botId : pickRandomBotId(userId);
   updateWallet(userId, newBalance, now);
-  insertEvent(userId, now, type, amount, label, newBalance, "task");
-  updateBotProgress(userId, type === "credit" ? amount : -amount);
+  insertEvent(
+    userId,
+    now,
+    type,
+    amount,
+    label,
+    newBalance,
+    "task",
+    resolvedBotId,
+    countsTowardTargets
+  );
+  if (countsTowardTargets) {
+    updateBotProgress(userId, type === "credit" ? amount : -amount);
+  }
 }
 
 function deliverDuePlannedEvents(userId) {
@@ -830,6 +1024,45 @@ function deliverDuePlannedEvents(userId) {
     recordEvent(userId, ev.type, ev.amount, ev.label);
     db.prepare("UPDATE planned_events SET fired = 1 WHERE id = ?").run(ev.id);
   }
+}
+
+// ---- Cambio 2: cobertura diaria garantizada por bot -------------------------
+// Revisa, para cada bot de este usuario, si ya tuvo al menos un evento tipo
+// 'task' hoy (día calendario, hora Colombia — colombiaDayStart). Al bot que
+// no haya tenido ninguno le genera uno de relleno: mismo pool de nombres de
+// tarea/razón de débito, mismo formato, mismo kind='task' — en todo lo que
+// el usuario puede ver (feed, historial por bot, JSON de la API) es
+// idéntico a un evento real. Lo único que lo distingue es
+// counts_toward_targets=0, una columna interna que ningún endpoint expone.
+function fillMissingDailyActivity(userId) {
+  const bots = db.prepare("SELECT id FROM bots WHERE user_id = ?").all(userId);
+  if (bots.length === 0) return;
+
+  const dayStartIso = colombiaDayStart(new Date()).toISOString();
+  const covered = new Set(
+    db
+      .prepare(
+        `SELECT DISTINCT bot_id FROM events
+         WHERE user_id = ? AND kind = 'task' AND bot_id IS NOT NULL AND ts >= ?`
+      )
+      .all(userId, dayStartIso)
+      .map((r) => r.bot_id)
+  );
+
+  for (const b of bots) {
+    if (covered.has(b.id)) continue;
+    const isCredit = Math.random() < CREDIT_PROBABILITY;
+    const amount = round2(randBetween(FILLER_MIN, FILLER_MAX));
+    const label = isCredit ? pick(TASK_NAMES) : pick(DEBIT_REASONS);
+    recordEvent(userId, isCredit ? "credit" : "debit", amount, label, {
+      botId: b.id,
+      countsTowardTargets: false,
+    });
+  }
+}
+
+function fillAllUsersDailyActivity() {
+  for (const uid of allAutomatonUserIds()) fillMissingDailyActivity(uid);
 }
 
 function allAutomatonUserIds() {
@@ -849,11 +1082,14 @@ function deliverAllDuePlannedEvents() {
 if (SIMULATION_ENABLED) {
   ensureAllUsersPlanned();
   deliverAllDuePlannedEvents(); // catch up on anything missed while the server was down
+  fillAllUsersDailyActivity(); // catch up on cobertura diaria por si el server estuvo apagado
   setInterval(ensureAllUsersPlanned, 15 * 60 * 1000); // re-check every 15 min for the next week
   setInterval(deliverAllDuePlannedEvents, 60 * 1000); // deliver due events every minute
+  setInterval(fillAllUsersDailyActivity, DAILY_COVERAGE_SWEEP_MS); // cobertura diaria por bot, cada hora
   console.log(
     "Simulación activa: eventos 15min–3h, cerrando cada semana (Colombia) con ganancia neta entre " +
-      `$${WEEKLY_PROFIT_MIN} y $${WEEKLY_PROFIT_MAX}, por cada usuario registrado.`
+      `$${WEEKLY_PROFIT_MIN} y $${WEEKLY_PROFIT_MAX}, por cada usuario registrado. ` +
+      "Cobertura diaria por bot verificada cada hora."
   );
 } else {
   console.log(
@@ -1125,8 +1361,10 @@ app.get("/api/status", requireRoleApi("user"), (req, res) => {
   const wallet = getWallet(userId);
   const bootAt = getMeta(userId, "boot_at");
 
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
+  // Día calendario hora Colombia (antes usaba la medianoche local del
+  // servidor — en Railway eso es UTC, 5 horas desfasado de Colombia, y
+  // además distinto del criterio que ya usa la regla semanal).
+  const startOfDay = colombiaDayStart(new Date());
   const todays = taskEventsSinceStmt.all(userId, startOfDay.toISOString());
   const todayCredit = round2(
     todays.filter((e) => e.type === "credit").reduce((s, e) => s + e.amount, 0)
@@ -1141,7 +1379,10 @@ app.get("/api/status", requireRoleApi("user"), (req, res) => {
   const weekStart = currentWeekStart(new Date());
   const weekStartKey = weekStart.toISOString();
   const weekTarget = getMeta(userId, `week_target_${weekStartKey}`);
-  const weekEvents = taskEventsSinceStmt.all(userId, weekStartKey);
+  // counting-only: excluye el relleno de cobertura diaria (Cambio 2), para
+  // que esto siga cerrando exacto en el rango calculado por
+  // generateWeeklyPlanIfMissing.
+  const weekEvents = countingTaskEventsSinceStmt.all(userId, weekStartKey);
   const weekNet = round2(
     weekEvents.reduce(
       (s, e) => s + (e.type === "credit" ? e.amount : -e.amount),
@@ -1241,6 +1482,24 @@ app.get("/api/bots", requireRoleApi("user"), (req, res) => {
       .prepare("SELECT * FROM bots WHERE user_id = ? ORDER BY id DESC LIMIT ?")
       .all(userId, limit),
   });
+});
+
+// Historial de actividad de UN bot específico — créditos, débitos, y
+// también los eventos de cobertura diaria del Cambio 2 (indistinguibles a
+// propósito: la consulta no filtra ni expone kind/counts_toward_targets).
+app.get("/api/bots/:id/events", requireRoleApi("user"), (req, res) => {
+  const botId = parseInt(req.params.id, 10);
+  if (isNaN(botId)) {
+    return res.status(400).json({ error: "ID de bot inválido." });
+  }
+  const bot = db
+    .prepare("SELECT id FROM bots WHERE id = ? AND user_id = ?")
+    .get(botId, req.user.id);
+  if (!bot) {
+    return res.status(404).json({ error: "Bot no encontrado." });
+  }
+  const limit = Math.min(parseInt(req.query.limit || "100", 10), 500);
+  res.json(botEventsStmt.all(req.user.id, botId, limit));
 });
 
 // Manejador de errores final: cualquier excepción no capturada en una ruta

@@ -65,12 +65,17 @@ cualquier motivo, no se guarda nada — ni el renombrado de tablas, ni cuentas
 a medias — y se reintenta desde cero, de forma segura, en el próximo
 arranque.
 
+Columnas nuevas que se agreguen en el futuro (como `bot_id` o
+`counts_toward_targets` en `events`) se añaden con `ALTER TABLE ADD COLUMN`
+a cualquier base de datos existente — nunca se recrea ni se borra una
+tabla con datos.
+
 ## Regla semanal
 
 Cada semana (sábado 00:00 → viernes 23:59:59, hora Colombia), **para cada
 usuario por separado**, se planifica por adelantado:
 
-1. Se sortea un objetivo de ganancia neta entre **$35 y $195**.
+1. Se sortea un objetivo de ganancia neta entre **$750 y $975**.
 2. Se generan los tiempos de los eventos de esa semana, separados entre
    **15 minutos y 3 horas** entre sí.
 3. Los débitos (costos de infraestructura) son montos naturales al azar
@@ -81,7 +86,17 @@ usuario por separado**, se planifica por adelantado:
 
 Esto garantiza que, sin importar cuántos eventos ocurran, la semana siempre
 cierra el viernes con una ganancia neta dentro del rango pedido — no es pura
-casualidad, está calculado desde el inicio de la semana.
+casualidad, está calculado desde el inicio de la semana. Con el hito de bot
+a $150 (ver abajo), este rango da entre 5 y 6 bots nuevos por semana en
+promedio, sin necesitar un mecanismo de "mínimo garantizado" aparte.
+
+Para que el objetivo siga siendo matemáticamente alcanzable con el tope de
+$25 por crédito incluso en el caso límite de muy pocas semanas/horas
+restantes (ej. una cuenta creada a pocas horas de que cierre la semana, con
+muy pocos eventos generados al azar), el generador agrega slots de crédito
+extra — sin el espaciado normal de 15min-3h — hasta que haya capacidad
+suficiente para cubrir el objetivo. Esto es poco frecuente y solo aplica a
+ese caso límite; una semana completa normal no lo necesita.
 
 Un proceso interno revisa cada minuto, para cada usuario registrado, si hay
 eventos "vencidos" (su hora ya llegó) y los aplica al saldo. Si el servidor
@@ -99,6 +114,48 @@ ese momento es menor a $50, se retira lo que haya disponible (retiro
 parcial) en vez de bloquear la creación del bot o dejar el saldo negativo.
 Igual que los retiros manuales, estos retiros automáticos no cuentan para la
 regla de ganancia semanal ni para el progreso hacia el siguiente bot.
+
+## Atribución de eventos a bots + historial por bot
+
+Cada evento de tarea (crédito o débito) de la planificación semanal se
+atribuye, en el momento en que se **entrega** (no cuando se genera el plan
+por adelantado), a un bot elegido al azar entre los que ese usuario tiene
+EN ESE MOMENTO — nunca a un bot que se vaya a crear después. El feed de
+actividad muestra qué bot generó cada evento (`BOT-014 — Web scraping —
+catálogo de precios`).
+
+En "FLOTA DE BOTS", cada fila tiene una flechita para desplegar el
+historial completo de ese bot específico. Varios bots pueden estar
+desplegados a la vez (no es acordeón de "solo uno"); cada panel desplegado
+tiene su propia altura máxima con scroll independiente, y la lista de bots
+en sí crece con la página en vez de quedar encerrada en una caja chica.
+
+Los eventos que ya existían antes de que se guardara a qué bot pertenecen
+(de antes de este cambio) recibieron, una sola vez, un bot asignado al azar
+entre los bots de ese usuario que ya existían en la fecha de cada evento
+(nunca uno creado después de esa fecha); si ningún bot calificaba para un
+evento muy viejo, se usó cualquier bot de ese usuario. Los retiros nunca
+tienen bot asignado — no los genera un bot.
+
+## Cobertura diaria garantizada por bot
+
+Un barrido corre cada hora (y una vez al iniciar el servidor, por si estuvo
+apagado) y revisa, para cada bot de cada usuario, si ya tuvo al menos un
+evento hoy (día calendario, hora Colombia). Al que no haya tenido ninguno
+le genera un evento de cobertura mínimo ($0.01–$0.05), usando las mismas
+listas de nombres de tarea / razones de débito que los eventos normales.
+
+Estos eventos son **intencionalmente indistinguibles** de la actividad
+real: mismo formato, mismo feed, mismo historial por bot — no hay ninguna
+etiqueta ni marca visible, ni en el frontend ni en las respuestas de la
+API, que delate cuáles son de cobertura. Lo único que los distingue es una
+columna interna (`counts_toward_targets = 0`) que ningún endpoint expone:
+por eso NO cuentan para la regla de ganancia semanal ni para el progreso
+hacia el próximo bot (si contaran, la semana ya no cerraría exacto en el
+rango calculado de antemano). Sí se incluyen en las estadísticas de "hoy"
+del dashboard (ingresos/egresos/tareas de hoy), para que esos números
+coincidan con lo que el feed en vivo muestra — excluirlos ahí sería, en sí
+mismo, la clase de inconsistencia que delataría que no son reales.
 
 ## Retiros manuales
 
