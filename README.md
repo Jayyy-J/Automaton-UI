@@ -65,14 +65,56 @@ cualquier motivo, no se guarda nada — ni el renombrado de tablas, ni cuentas
 a medias — y se reintenta desde cero, de forma segura, en el próximo
 arranque.
 
-## Regla semanal
+Columnas nuevas que se agreguen en el futuro (como `bot_id` o
+`counts_toward_targets` en `events`, o `logic_profile` en `users`) se
+añaden con `ALTER TABLE ADD COLUMN` a cualquier base de datos existente —
+nunca se recrea ni se borra una tabla con datos. Cuando una columna nueva
+afecta la simulación (como `logic_profile`), la migración de una sola vez
+correspondiente también replanifica el resto de la semana en curso de cada
+usuario afectado, para que el cambio aplique de inmediato en vez de esperar
+a la siguiente semana.
 
-Cada semana (sábado 00:00 → viernes 23:59:59, hora Colombia), **para cada
-usuario por separado**, se planifica por adelantado:
+## Perfiles de lógica (por usuario)
 
-1. Se sortea un objetivo de ganancia neta entre **$35 y $195**.
-2. Se generan los tiempos de los eventos de esa semana, separados entre
-   **15 minutos y 3 horas** entre sí.
+Cada usuario corre bajo uno de dos perfiles (`users.logic_profile`), que
+determinan el objetivo de ganancia semanal y el ritmo de eventos. Todo lo
+demás (atribución a bots, historial por bot, cobertura diaria, retiro
+automático por bot duplicado, validación de Solana, etc.) es idéntico para
+ambos perfiles.
+
+- **Lógica 1** (default para todas las cuentas, salvo la excepción de
+  abajo): objetivo semanal **$150–$595**, ritmo de eventos **15min–3h fijo**
+  (el ritmo original del proyecto, desde antes de cualquier aceleración).
+  Con el hito de bot a $150, da 1, 2 o 3 bots nuevos por semana con
+  probabilidad pareja entre sí (~33% cada uno) y nunca 0. *Nota:* como el
+  progreso hacia el próximo bot se acumula entre semanas (nunca se reinicia
+  — ver "Flota de bots" abajo), en una minoría de semanas (~16%, aceptado a
+  propósito) puede salir un cuarto bot por el remanente de la semana
+  anterior; no es un error.
+- **Lógica 2** (hoy, solo `jryesid@gmail.com`): objetivo semanal
+  **$750–$975** (da 5-6 bots nuevos por semana de forma natural). Ritmo de
+  eventos dinámico: espaciado mínimo fijo en 5 min; el máximo arranca en 45
+  min con pocos bots y baja linealmente hasta un techo absoluto de 30 min
+  una vez la flota llega a 100 bots (de ahí en adelante se queda plano en 30
+  min) — a propósito, más bots da más movimiento visible en el feed.
+
+**Cambiar el perfil de un usuario:** en `/admin`, cada fila de la tabla de
+cuentas muestra su perfil actual (`Lógica 1` / `Lógica 2`) con un botón para
+alternarlo. El cambio se aplica **de inmediato**: se recalcula ahí mismo el
+resto de la semana en curso de ese usuario con los parámetros del nuevo
+perfil — nunca hay que esperar al próximo sábado. Los eventos que ya se
+entregaron esta semana (reflejados en el saldo e historial) nunca se tocan
+ni se revierten; solo se descartan y regeneran los eventos programados que
+todavía no habían ocurrido, usando el mismo "escalado proporcional al
+tiempo restante" que ya aplica cuando una semana se planifica a mitad de
+camino (cuenta nueva a medio camino de la semana).
+
+Cada semana (sábado 00:00 → viernes 23:59:59, hora Colombia), para cada
+usuario por separado, se planifica por adelantado:
+
+1. Se sortea un objetivo de ganancia neta dentro del rango de su perfil.
+2. Se generan los tiempos de los eventos de esa semana, al ritmo del
+   perfil.
 3. Los débitos (costos de infraestructura) son montos naturales al azar
    ($0.10–$5).
 4. Los créditos (tareas pagadas) se calculan matemáticamente para que:
@@ -80,8 +122,18 @@ usuario por separado**, se planifica por adelantado:
    $0.50–$25.
 
 Esto garantiza que, sin importar cuántos eventos ocurran, la semana siempre
-cierra el viernes con una ganancia neta dentro del rango pedido — no es pura
-casualidad, está calculado desde el inicio de la semana.
+cierra el viernes con una ganancia neta dentro del rango del perfil — no es
+pura casualidad, está calculado desde el inicio de la semana (o desde el
+momento del cambio de perfil, si se cambió a mitad de camino).
+
+Para que el objetivo siga siendo matemáticamente alcanzable con el tope de
+$25 por crédito incluso en el caso límite de muy pocas horas restantes (ej.
+una cuenta creada, o un cambio de perfil, a pocas horas de que cierre la
+semana, con muy pocos eventos generados al azar), el generador agrega slots
+de crédito extra — sin el espaciado normal del perfil — hasta que haya
+capacidad suficiente para cubrir el objetivo. Esto es poco frecuente y solo
+aplica a ese caso límite; una semana completa normal no lo necesita
+(verificado con 100 usuarios de prueba entre ambos perfiles: 0 fallas).
 
 Un proceso interno revisa cada minuto, para cada usuario registrado, si hay
 eventos "vencidos" (su hora ya llegó) y los aplica al saldo. Si el servidor
@@ -99,6 +151,48 @@ ese momento es menor a $50, se retira lo que haya disponible (retiro
 parcial) en vez de bloquear la creación del bot o dejar el saldo negativo.
 Igual que los retiros manuales, estos retiros automáticos no cuentan para la
 regla de ganancia semanal ni para el progreso hacia el siguiente bot.
+
+## Atribución de eventos a bots + historial por bot
+
+Cada evento de tarea (crédito o débito) de la planificación semanal se
+atribuye, en el momento en que se **entrega** (no cuando se genera el plan
+por adelantado), a un bot elegido al azar entre los que ese usuario tiene
+EN ESE MOMENTO — nunca a un bot que se vaya a crear después. El feed de
+actividad muestra qué bot generó cada evento (`BOT-014 — Web scraping —
+catálogo de precios`).
+
+En "FLOTA DE BOTS", cada fila tiene una flechita para desplegar el
+historial completo de ese bot específico. Varios bots pueden estar
+desplegados a la vez (no es acordeón de "solo uno"); cada panel desplegado
+tiene su propia altura máxima con scroll independiente, y la lista de bots
+en sí crece con la página en vez de quedar encerrada en una caja chica.
+
+Los eventos que ya existían antes de que se guardara a qué bot pertenecen
+(de antes de este cambio) recibieron, una sola vez, un bot asignado al azar
+entre los bots de ese usuario que ya existían en la fecha de cada evento
+(nunca uno creado después de esa fecha); si ningún bot calificaba para un
+evento muy viejo, se usó cualquier bot de ese usuario. Los retiros nunca
+tienen bot asignado — no los genera un bot.
+
+## Cobertura diaria garantizada por bot
+
+Un barrido corre cada hora (y una vez al iniciar el servidor, por si estuvo
+apagado) y revisa, para cada bot de cada usuario, si ya tuvo al menos un
+evento hoy (día calendario, hora Colombia). Al que no haya tenido ninguno
+le genera un evento de cobertura mínimo ($0.01–$0.05), usando las mismas
+listas de nombres de tarea / razones de débito que los eventos normales.
+
+Estos eventos son **intencionalmente indistinguibles** de la actividad
+real: mismo formato, mismo feed, mismo historial por bot — no hay ninguna
+etiqueta ni marca visible, ni en el frontend ni en las respuestas de la
+API, que delate cuáles son de cobertura. Lo único que los distingue es una
+columna interna (`counts_toward_targets = 0`) que ningún endpoint expone:
+por eso NO cuentan para la regla de ganancia semanal ni para el progreso
+hacia el próximo bot (si contaran, la semana ya no cerraría exacto en el
+rango calculado de antemano). Sí se incluyen en las estadísticas de "hoy"
+del dashboard (ingresos/egresos/tareas de hoy), para que esos números
+coincidan con lo que el feed en vivo muestra — excluirlos ahí sería, en sí
+mismo, la clase de inconsistencia que delataría que no son reales.
 
 ## Retiros manuales
 

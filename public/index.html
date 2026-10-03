@@ -189,6 +189,11 @@
   .w-row .addr{ color: var(--text); }
   .w-row .amt{ text-align:right; font-weight:600; color: var(--danger); }
   .w-row .bal{ text-align:right; color: var(--text-dim); font-size: 12px; }
+  .w-auto-tag{
+    font-size: 10px; color: var(--amber); border: 1px solid #f5b04d55;
+    background: #f5b04d11; padding: 2px 6px; border-radius: 10px;
+    margin-left: 8px; letter-spacing: 0.02em; white-space: nowrap;
+  }
 
   /* bot fleet section */
   .bots-summary{
@@ -198,15 +203,40 @@
     margin-bottom: 16px;
   }
   .bots-summary .vital{ background: #0d1213; padding: 16px 18px; }
+
+  /* El contenedor de bots crece con la página (scroll normal) en vez de
+     quedar limitado a una caja chica con su propio scroll — cada panel de
+     historial desplegado ya tiene su propio max-height+scroll (abajo), así
+     que no hace falta un segundo scroll anidado para la lista entera. */
+  #botsFeed{ max-height: none; overflow: visible; }
+
+  .bot-row-wrap:last-child .bot-row{ border-bottom:none; }
   .bot-row{
-    display:grid; grid-template-columns: 100px 1fr;
+    display:grid; grid-template-columns: 24px 100px 1fr;
     gap: 14px; align-items:center;
     padding: 12px 16px; border-bottom: 1px solid var(--line);
     font-family: 'IBM Plex Mono', monospace; font-size: 13px;
   }
-  .bot-row:last-child{ border-bottom:none; }
   .bot-row .label{ color: var(--alive); font-weight: 600; }
   .bot-row .t{ color: var(--text-dim); font-size: 11px; }
+  .bot-toggle{
+    background: transparent; border: none; color: var(--text-dim);
+    font-size: 13px; cursor: pointer; padding: 2px 4px;
+    transition: transform 0.2s ease, color 0.2s ease;
+    line-height: 1;
+  }
+  .bot-toggle:hover{ color: var(--alive); }
+  .bot-toggle.open{ transform: rotate(90deg); color: var(--alive); }
+
+  .bot-history{
+    max-height: 0; overflow: hidden;
+    transition: max-height 0.3s ease;
+    border-bottom: 1px solid var(--line);
+    background: #0a0e0f;
+  }
+  .bot-history.open{ max-height: 280px; overflow-y: auto; }
+  .bot-history-inner .row{ padding: 10px 16px 10px 46px; font-size: 12px; }
+  .bot-history-inner .wallet-empty{ padding: 14px 16px; }
 </style>
 </head>
 <body>
@@ -360,9 +390,10 @@ function drawECG(){
 function renderRow(ev){
   const row = document.createElement('div');
   row.className = 'row';
+  const label = ev.bot_label ? `${ev.bot_label} — ${ev.label}` : ev.label;
   row.innerHTML = `
     <div class="t">${fmtTime(ev.ts)}</div>
-    <div class="label">${ev.label}</div>
+    <div class="label">${label}</div>
     <div class="amt ${ev.type}">${ev.type === 'credit' ? '+' : '-'}${fmt(ev.amount)}</div>
     <div class="bal">${fmt(ev.balance_after)}</div>
   `;
@@ -423,14 +454,72 @@ async function tick(){
   await refreshBots();
 }
 
+function renderBotHistoryRow(ev){
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML = `
+    <div class="t">${fmtTime(ev.ts)}</div>
+    <div class="label">${ev.label}</div>
+    <div class="amt ${ev.type}">${ev.type === 'credit' ? '+' : '-'}${fmt(ev.amount)}</div>
+    <div class="bal">${fmt(ev.balance_after)}</div>
+  `;
+  return row;
+}
+
+async function toggleBotHistory(botId, toggleBtn, panel, inner){
+  const isOpen = panel.classList.contains('open');
+  if(isOpen){
+    panel.classList.remove('open');
+    toggleBtn.classList.remove('open');
+    return;
+  }
+  panel.classList.add('open');
+  toggleBtn.classList.add('open');
+
+  inner.innerHTML = '<div class="wallet-empty">Cargando…</div>';
+  try{
+    const res = await fetch(`/api/bots/${botId}/events?limit=200`);
+    if(handleAuthFailure(res)) return;
+    const events = await res.json();
+    if(!res.ok){
+      inner.innerHTML = '<div class="wallet-empty">No se pudo cargar el historial.</div>';
+      return;
+    }
+    if(events.length === 0){
+      inner.innerHTML = '<div class="wallet-empty">Sin actividad registrada todavía.</div>';
+      return;
+    }
+    inner.innerHTML = '';
+    events.forEach(ev => inner.appendChild(renderBotHistoryRow(ev)));
+  }catch(e){
+    inner.innerHTML = '<div class="wallet-empty">Error de conexión.</div>';
+  }
+}
+
 function renderBotRow(b){
+  const wrap = document.createElement('div');
+  wrap.className = 'bot-row-wrap';
+
   const row = document.createElement('div');
   row.className = 'bot-row';
   row.innerHTML = `
+    <button class="bot-toggle" type="button" aria-label="Ver historial de ${b.label}">▸</button>
     <div class="label">${b.label}</div>
     <div class="t">creado ${fmtTime(b.created_at)}</div>
   `;
-  return row;
+
+  const panel = document.createElement('div');
+  panel.className = 'bot-history';
+  const inner = document.createElement('div');
+  inner.className = 'bot-history-inner';
+  panel.appendChild(inner);
+
+  const toggleBtn = row.querySelector('.bot-toggle');
+  toggleBtn.addEventListener('click', () => toggleBotHistory(b.id, toggleBtn, panel, inner));
+
+  wrap.appendChild(row);
+  wrap.appendChild(panel);
+  return wrap;
 }
 
 let knownBotIds = new Set();
@@ -460,9 +549,12 @@ async function refreshBots(){
 function renderWithdrawRow(w){
   const row = document.createElement('div');
   row.className = 'w-row';
+  const autoTag = w.kind === 'auto_bot'
+    ? '<span class="w-auto-tag">automático · bot duplicado</span>'
+    : '';
   row.innerHTML = `
     <div class="t">${fmtTime(w.ts)}</div>
-    <div class="addr">${shortAddr(w.address)}</div>
+    <div class="addr">${shortAddr(w.address)}${autoTag}</div>
     <div class="amt">-${fmt(w.amount)}</div>
     <div class="bal">${fmt(w.balance_after)}</div>
   `;
